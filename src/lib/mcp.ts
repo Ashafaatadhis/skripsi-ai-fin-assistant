@@ -20,14 +20,67 @@ export async function getMcpClient(): Promise<Client> {
     },
     {
       capabilities: {},
-    }
+    },
   );
 
-  // Use a type cast to the interface since the SDK classes might have strict property 
-  // differences with exactOptionalPropertyTypes enabled.
   await client.connect(transport as Transport);
   mcpClient = client;
   return mcpClient;
+}
+
+/**
+ * PRO TIP: Fungsi ini mengubah JSON Schema dari MCP Server 
+ * menjadi Zod Schema secara dinamis. 
+ * Jadi kita tidak perlu menulis ulang Zod di sisi asisten!
+ */
+function createDynamicZodSchema(inputSchema: any): z.ZodObject<any> {
+  const shape: Record<string, z.ZodTypeAny> = {};
+
+  if (inputSchema.type === "object" && inputSchema.properties) {
+    for (const [key, value] of Object.entries<any>(inputSchema.properties)) {
+      let validator: z.ZodTypeAny;
+
+      // Fungsi helper untuk mapping tipe data JSON Schema ke Zod
+      const mapType = (jsonType: any): z.ZodTypeAny => {
+        switch (jsonType.type) {
+          case "string":
+            return z.string();
+          case "number":
+            return z.number();
+          case "integer":
+            return z.number().int();
+          case "boolean":
+            return z.boolean();
+          case "array":
+            // Jika ada info tipe di dalam array (items), kita petakan secara rekursif
+            if (jsonType.items) {
+              return z.array(mapType(jsonType.items));
+            }
+            return z.array(z.any());
+          case "object":
+            if (jsonType.properties) {
+              return createDynamicZodSchema(jsonType);
+            }
+            return z.record(z.string(), z.unknown());
+          default:
+            return z.unknown();
+        }
+      };
+
+      validator = mapType(value);
+
+      // Tambahkan deskripsi agar AI makin paham
+      if (value.description) {
+        validator = (validator as any).describe(value.description);
+      }
+
+      // Cek apakah field ini opsional
+      const isRequired = inputSchema.required?.includes(key);
+      shape[key] = isRequired ? validator : validator.optional();
+    }
+  }
+
+  return z.object(shape);
 }
 
 export async function getMcpTools(): Promise<StructuredTool[]> {
@@ -35,6 +88,10 @@ export async function getMcpTools(): Promise<StructuredTool[]> {
   const { tools } = await client.listTools();
 
   return tools.map((toolInfo) => {
+    // OTOMATIS: Ambil skema langsung dari server
+    const dynamicSchema = createDynamicZodSchema(toolInfo.inputSchema);
+    console.log(`📡 Registered Dynamic Tool: [${toolInfo.name}]`, JSON.stringify(toolInfo.inputSchema));
+
     return tool(
       async (args) => {
         console.log(`🛠️ Calling Tool [${toolInfo.name}] with args:`, args);
@@ -42,16 +99,12 @@ export async function getMcpTools(): Promise<StructuredTool[]> {
           name: toolInfo.name,
           arguments: args as Record<string, unknown>,
         });
+        
         console.log(`📦 Tool [${toolInfo.name}] Response:`, JSON.stringify(result).substring(0, 500));
 
         if (result.content && Array.isArray(result.content)) {
           return result.content
-            .map((c) => {
-              if (c.type === "text") {
-                return c.text;
-              }
-              return JSON.stringify(c);
-            })
+            .map((c: any) => (c.type === "text" ? c.text : JSON.stringify(c)))
             .join("\n");
         }
         return JSON.stringify(result);
@@ -59,8 +112,8 @@ export async function getMcpTools(): Promise<StructuredTool[]> {
       {
         name: toolInfo.name,
         description: toolInfo.description || "",
-        schema: z.record(z.string(), z.unknown()),
-      }
+        schema: dynamicSchema, // Gunakan skema dinamis
+      },
     );
   });
 }

@@ -20,7 +20,7 @@ export const handleTextMessage = async (ctx: Context) => {
 
     // Kirim jawaban ke user
     await ctx.reply(aiResponse, {
-      parse_mode: "Markdown",
+      parse_mode: "HTML",
     });
   } catch (error) {
     console.error("Groq Error:", error);
@@ -51,7 +51,7 @@ export const handlePhotoMessage = async (ctx: Context) => {
     );
 
     // Kirim hasil akhir
-    await ctx.reply(analysis, { parse_mode: "Markdown" });
+    await ctx.reply(analysis, { parse_mode: "HTML" });
   } catch (error) {
     console.error("Vision Error:", error);
     await ctx.reply("Duh, kamera gue burem. Coba kirim ulang struknya!");
