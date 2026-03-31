@@ -62,10 +62,10 @@ const allMcpTools = await getMcpTools();
 
 // Pisahkan tools untuk agent spesifik
 const recorderTools = allMcpTools.filter((t) =>
-  ["add_transaction", "get_balance", "list_transactions"].includes(t.name),
+  ["add_transaction", "get_balance", "list_transactions", "get_transaction_by_id"].includes(t.name),
 );
 const splitBillTools = allMcpTools.filter((t) =>
-  ["split_bill", "list_debts", "settle_debt"].includes(t.name),
+  ["split_bill", "list_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(t.name),
 );
 const memoryTools = allMcpTools.filter((t) =>
   ["search_memory", "save_memory"].includes(t.name),
@@ -94,7 +94,7 @@ const supervisorNode = async (state: typeof GraphState.State) => {
     new SystemMessage(
       `${SUPERVISOR_PROMPT}\n\nINFO SISTEM:\nTanggal hari ini: ${dateStr}`,
     ),
-    ...state.messages.slice(-6), // Konsisten: Supervisor juga cukup lihat 6 pesan terakhir
+    ...state.messages.slice(-6),
     new HumanMessage(
       `Berdasarkan percakapan di atas, siapa agen yang paling tepat untuk merespon? Balas HANYA dengan salah satu kode nama agen berikut: ${options.join(", ")}.`,
     ),
@@ -103,7 +103,7 @@ const supervisorNode = async (state: typeof GraphState.State) => {
   const response = await modelWithRouting.invoke(prompt);
   const decision = cleanAIResponse(response.content.toString()).toUpperCase();
 
-  let next = "general_chat"; // Default ke general chat kalau ragu
+  let next = "general_chat";
   if (decision.includes("RECORDER")) next = "recorder";
   if (decision.includes("SPLIT_BILL")) next = "split_bill";
   if (decision.includes("MEMORY")) next = "memory";
@@ -152,12 +152,11 @@ ID CHAT: ${chatId}
 
     const prompt = [
       new SystemMessage(`${agentPrompt}\n\nKONTEKS PENTING:\n${context}`),
-      ...state.messages.slice(-6), // Konsisten: Agen juga cukup lihat 6 pesan terakhir
+      ...state.messages.slice(-6),
     ];
 
     const response = await agentModel.invoke(prompt);
 
-    // Pembersihan response text jika bukan tool call
     if (!response.tool_calls || response.tool_calls.length === 0) {
       response.content = cleanAIResponse(response.content.toString());
     }
@@ -183,7 +182,6 @@ const generalChatNode = createAgentNode(
   [],
 );
 
-// 3. Summarize Node (Sama seperti sebelumnya)
 const summarizeMessages = async (state: typeof GraphState.State) => {
   const { messages, summary } = state;
   if (messages.length > 8) {
@@ -196,9 +194,7 @@ const summarizeMessages = async (state: typeof GraphState.State) => {
     });
     const response = await modelRaw.invoke(summaryInput);
 
-    // AMBIL GUNTING: Kita sisakan 6 pesan saja
     const trimmedMessages: ReplaceableMessages = messages.slice(-6);
-    // KASIH STEMPEL GANTI: Biar Reducer mau menghapus yang lama
     trimmedMessages._replace = true;
 
     return {
@@ -209,7 +205,6 @@ const summarizeMessages = async (state: typeof GraphState.State) => {
   return {};
 };
 
-// --- BUILD GRAPH ---
 const workflow = new StateGraph(GraphState)
   .addNode("summarize", summarizeMessages)
   .addNode("supervisor", supervisorNode)
@@ -229,7 +224,6 @@ const workflow = new StateGraph(GraphState)
     general_chat: "general_chat",
   })
 
-  // Semua agen jika memanggil tool, lari ke node tools
   .addConditionalEdges("recorder", (state) => {
     const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
     return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
@@ -242,13 +236,11 @@ const workflow = new StateGraph(GraphState)
     const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
     return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
   })
-  .addConditionalEdges("general_chat", (state) => {
+  .addConditionalEdges("general_chat", () => {
     return END;
   })
 
-  // Setelah tools dijalankan, balik ke agen yang manggil agar dia bisa memproses hasilnya
   .addConditionalEdges("tools", (state) => {
-    // Ambil pesan AIMessage terakhir yang punya tool_calls
     const lastAI = [...state.messages]
       .reverse()
       .find(
@@ -257,12 +249,12 @@ const workflow = new StateGraph(GraphState)
     if (lastAI) {
       const toolName = lastAI.tool_calls?.[0]?.name;
       if (
-        ["add_transaction", "get_balance", "list_transactions"].includes(
+        ["add_transaction", "get_balance", "list_transactions", "get_transaction_by_id"].includes(
           toolName!,
         )
       )
         return "recorder";
-      if (["split_bill", "list_debts", "settle_debt"].includes(toolName!))
+      if (["split_bill", "list_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(toolName!))
         return "split_bill";
       if (["search_memory", "save_memory"].includes(toolName!)) return "memory";
     }
@@ -272,7 +264,6 @@ const workflow = new StateGraph(GraphState)
 const checkpointer = new MemorySaver();
 export const app = workflow.compile({ checkpointer });
 
-// --- RUNNER FUNCTIONS ---
 export async function runNaturalChat(chatId: string, userInput: string) {
   const config = { configurable: { thread_id: chatId } };
   const output = await app.invoke(
