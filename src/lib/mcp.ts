@@ -102,12 +102,14 @@ export async function getMcpTools(): Promise<StructuredTool[]> {
         
         console.log(`📦 Tool [${toolInfo.name}] Response:`, JSON.stringify(result).substring(0, 500));
 
+        const prefix = result.isError ? "[TOOL_ERROR]\n" : "";
+
         if (result.content && Array.isArray(result.content)) {
-          return result.content
+          return prefix + result.content
             .map((c: any) => (c.type === "text" ? c.text : JSON.stringify(c)))
             .join("\n");
         }
-        return JSON.stringify(result);
+        return prefix + JSON.stringify(result);
       },
       {
         name: toolInfo.name,

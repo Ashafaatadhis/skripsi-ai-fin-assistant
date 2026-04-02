@@ -22,6 +22,7 @@ import {
   GENERAL_CHAT_AGENT_PROMPT,
   SUMMARIZE_PROMPT_TEMPLATE,
 } from "@/app/chains/prompt.js";
+import { cleanAIResponse, detectClarificationRoute } from "@/app/chains/clarification.js";
 import { getMcpTools } from "@/lib/mcp.js";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { StructuredTool } from "@langchain/core/tools";
@@ -62,22 +63,25 @@ const allMcpTools = await getMcpTools();
 
 // Pisahkan tools untuk agent spesifik
 const recorderTools = allMcpTools.filter((t) =>
-  ["add_transaction", "get_balance", "list_transactions", "get_transaction_by_id"].includes(t.name),
+  ["add_transaction", "get_balance", "list_transactions", "find_transactions", "get_transaction_by_id"].includes(t.name),
 );
 const splitBillTools = allMcpTools.filter((t) =>
-  ["split_bill", "list_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(t.name),
+  ["split_bill", "list_debts", "find_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(t.name),
 );
 const memoryTools = allMcpTools.filter((t) =>
   ["search_memory", "save_memory"].includes(t.name),
 );
 
-const cleanAIResponse = (text: string) =>
-  text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
-
 // --- NODES ---
 
 // 1. Supervisor Node: Menentukan agen mana yang harus dipanggil
 const supervisorNode = async (state: typeof GraphState.State) => {
+  const clarificationRoute = detectClarificationRoute(state.messages);
+  if (clarificationRoute) {
+    console.log(`🧭 Klarifikasi terdeteksi, langsung diarahkan ke: ${clarificationRoute}`);
+    return { next: clarificationRoute };
+  }
+
   const options = ["RECORDER", "SPLIT_BILL", "MEMORY", "GENERAL_CHAT"];
 
   const modelWithRouting = modelRaw;
@@ -248,13 +252,13 @@ const workflow = new StateGraph(GraphState)
       ) as AIMessage;
     if (lastAI) {
       const toolName = lastAI.tool_calls?.[0]?.name;
-      if (
-        ["add_transaction", "get_balance", "list_transactions", "get_transaction_by_id"].includes(
-          toolName!,
+        if (
+          ["add_transaction", "get_balance", "list_transactions", "find_transactions", "get_transaction_by_id"].includes(
+            toolName!,
+          )
         )
-      )
         return "recorder";
-      if (["split_bill", "list_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(toolName!))
+      if (["split_bill", "list_debts", "find_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(toolName!))
         return "split_bill";
       if (["search_memory", "save_memory"].includes(toolName!)) return "memory";
     }
