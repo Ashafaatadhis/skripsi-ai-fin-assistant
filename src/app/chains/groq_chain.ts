@@ -19,6 +19,7 @@ import {
   SPLIT_BILL_AGENT_PROMPT,
   GENERAL_CHAT_AGENT_PROMPT,
   SUMMARIZE_PROMPT_TEMPLATE,
+  CONDENSE_SUMMARY_PROMPT_TEMPLATE,
 } from "@/app/chains/prompt.js";
 import { cleanAIResponse } from "@/app/chains/clarification.js";
 import { createInitializedCheckpointer } from "@/app/chains/checkpointer.js";
@@ -30,8 +31,10 @@ import {
 } from "@/app/chains/memory-checkpoint.js";
 import {
   RECENT_RAW_TAIL_COUNT,
-  estimateContextSize,
+  estimateMessagesTokens,
+  estimateSummaryTokens,
   shouldSummarizeMessages,
+  shouldCondenseSummary,
 } from "@/app/chains/context-budget.js";
 import { getMcpTools } from "@/lib/mcp.js";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
@@ -264,7 +267,7 @@ const summarizeMessages = async (
   config: LangGraphRunnableConfig,
 ) => {
   const { messages, summary, messagesSinceLastMemorySave, pendingMemoryCandidates } = state;
-  if (shouldSummarizeMessages(messages, summary)) {
+  if (shouldSummarizeMessages(messages)) {
     const chatId = config.configurable?.thread_id || "unknown";
     const droppedMessages = messages.slice(0, -RECENT_RAW_TAIL_COUNT);
     if (droppedMessages.length === 0) {
@@ -272,12 +275,12 @@ const summarizeMessages = async (
     }
 
     const nextCounter = messagesSinceLastMemorySave + droppedMessages.length;
-    const estimatedContextSize = estimateContextSize(messages, summary);
     logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_TRIGGER", {
       chatId,
       messageCount: messages.length,
       droppedMessageCount: droppedMessages.length,
-      contextSize: estimatedContextSize,
+      messagesTokens: estimateMessagesTokens(messages),
+      summaryTokens: estimateSummaryTokens(summary),
       pendingCandidateCount: pendingMemoryCandidates.length,
       messagesSinceLastMemorySave,
       nextCheckpointCounter: nextCounter,
@@ -288,13 +291,28 @@ const summarizeMessages = async (
       messages: droppedMessages,
     });
     const response = await modelRaw.invoke(summaryInput);
-    const nextSummary = finalizeShortTermSummary(
+    let nextSummary = finalizeShortTermSummary(
       response.content.toString(),
       summary,
     );
+
+    if (shouldCondenseSummary(nextSummary)) {
+      logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_CONDENSE_TRIGGER", {
+        chatId,
+        summaryTokens: estimateSummaryTokens(nextSummary),
+      });
+      const condenseInput = await CONDENSE_SUMMARY_PROMPT_TEMPLATE.invoke({ summary: nextSummary });
+      const condenseResponse = await modelRaw.invoke(condenseInput);
+      nextSummary = finalizeShortTermSummary(condenseResponse.content.toString(), nextSummary);
+      logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_CONDENSE_DONE", {
+        chatId,
+        summaryTokens: estimateSummaryTokens(nextSummary),
+      });
+    }
+
     logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_DONE", {
       chatId,
-      summaryLength: nextSummary.length,
+      summaryTokens: estimateSummaryTokens(nextSummary),
       keptRawMessageCount: RECENT_RAW_TAIL_COUNT,
     });
 

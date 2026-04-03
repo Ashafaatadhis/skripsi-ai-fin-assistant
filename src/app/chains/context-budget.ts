@@ -2,30 +2,32 @@ import { BaseMessage } from "@langchain/core/messages";
 import { getMessageText } from "@/app/chains/clarification.js";
 
 export const RECENT_RAW_TAIL_COUNT = 6;
-export const SOFT_CONTEXT_LIMIT = 3500;
+export const MESSAGE_TOKEN_LIMIT = 1000;
+export const SUMMARY_TOKEN_LIMIT = 500;
 
-function estimateTextSize(text: string) {
+function estimateTokens(text: string) {
   return Math.ceil(text.trim().length / 4);
 }
 
-export function estimateMessageSize(message: BaseMessage) {
-  return estimateTextSize(getMessageText(message));
+export function estimateMessageTokens(message: BaseMessage) {
+  return estimateTokens(getMessageText(message));
 }
 
-export function estimateContextSize(messages: BaseMessage[], summary: string) {
-  const summarySize = summary.trim() ? estimateTextSize(summary) : 0;
-  const messageSize = messages.reduce(
-    (total, message) => total + estimateMessageSize(message),
-    0,
-  );
-
-  return summarySize + messageSize;
+export function estimateMessagesTokens(messages: BaseMessage[]) {
+  return messages.reduce((total, message) => total + estimateMessageTokens(message), 0);
 }
 
-export function shouldSummarizeMessages(messages: BaseMessage[], summary: string) {
+export function estimateSummaryTokens(summary: string) {
+  return estimateTokens(summary);
+}
+
+export function shouldSummarizeMessages(messages: BaseMessage[]) {
   if (messages.length <= RECENT_RAW_TAIL_COUNT) {
     return false;
   }
+  return estimateMessagesTokens(messages) > MESSAGE_TOKEN_LIMIT;
+}
 
-  return estimateContextSize(messages, summary) > SOFT_CONTEXT_LIMIT;
+export function shouldCondenseSummary(summary: string) {
+  return estimateSummaryTokens(summary) > SUMMARY_TOKEN_LIMIT;
 }

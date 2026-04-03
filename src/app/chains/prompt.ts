@@ -32,6 +32,23 @@ Ringkasan sebelumnya:
   ["user", "Perbarui ringkasan kerja berdasarkan percakapan di atas."],
 ]);
 
+export const CONDENSE_SUMMARY_PROMPT_TEMPLATE = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    `Tugas kamu adalah memadatkan ringkasan percakapan yang terlalu panjang menjadi lebih ringkas.
+
+Aturan:
+1. Pertahankan semua fakta penting: nama user, profil, preferensi, tujuan finansial, dan konteks aktif.
+2. Buang detail yang sudah tidak relevan atau sudah selesai.
+3. Tulis dalam teks polos, maksimal 5 baris.
+4. Gunakan format yang sama:
+   - KONTEKS AKTIF: ...
+   - FAKTA/PROFILE PENTING: ...
+   - CATATAN LANJUT: ...`,
+  ],
+  ["user", "Padatkan ringkasan berikut:\n\n{summary}"],
+]);
+
 export const MEMORY_CHECKPOINT_PROMPT_TEMPLATE =
   ChatPromptTemplate.fromMessages([
     [
