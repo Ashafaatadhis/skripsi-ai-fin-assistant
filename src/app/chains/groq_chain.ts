@@ -456,7 +456,13 @@ const generalChatNode = createAgentNode(
 const confirmToolNode = async (state: typeof GraphState.State) => {
   const toolCall = getPrimaryToolCall(state.messages);
   if (!toolCall) {
-    return { confirmationDecision: "missing_tool_call" };
+    logger.warn("Confirmation requested but no tool call was found", {
+      eventName: "TOOL_CONFIRMATION_MISSING_TOOL_CALL",
+    });
+    return {
+      confirmationDecision: "rejected",
+      messages: [new AIMessage("Maaf, aku tidak menemukan aksi yang perlu dikonfirmasi.")],
+    };
   }
 
   const confirmationText = formatConfirmation({
@@ -638,7 +644,7 @@ const summarizeMessages = async (
           chatId,
           pendingCount: nextPendingMemoryCandidates.length,
           promotedCount: promotedCandidates.length,
-          messagesSinceLastMemorySave: nextMemorySaveCounter,
+          tokensSinceLastMemorySave: nextMemorySaveCounter,
         });
       } catch (error) {
         logger.error("Long-term memory checkpoint failed", {
@@ -657,7 +663,7 @@ const summarizeMessages = async (
       state: {
         summaryPreview: truncateForLog(nextSummary, 220),
         messagesCount: trimmedMessages.length,
-        messagesSinceLastMemorySave: nextMemorySaveCounter,
+        tokensSinceLastMemorySave: nextMemorySaveCounter,
         pendingMemoryCandidates: summarizePendingCandidates(nextPendingMemoryCandidates),
         recentMessages: summarizeMessagesForLog(trimmedMessages),
       },
@@ -789,6 +795,24 @@ export async function runNaturalChat(chatId: string, userInput: string, options?
       },
     });
 
+    const postInvokeState = await app.getState(config);
+    const activeInterrupt = postInvokeState.tasks
+      .flatMap((task) => task.interrupts ?? [])
+      .find((active) => {
+        const value = active.value as { type?: string } | undefined;
+        return value?.type === "tool_confirmation";
+      });
+
+    if (activeInterrupt) {
+      const interruptValue = activeInterrupt.value as { prompt?: string };
+      logger.info("Returning active confirmation prompt to user", {
+        eventName: "APP_INTERRUPT_PROMPT_RETURNED",
+        chatId,
+        promptPreview: truncateForLog(interruptValue.prompt ?? "", 250),
+      });
+      return interruptValue.prompt ?? "Balas ya atau batal.";
+    }
+
     return lastMessage?.content.toString().trim() || "Maaf, jawabanku tadi kosong. Coba ulang ya.";
   } catch (error) {
     logger.error("App invoke failed", {
@@ -810,6 +834,7 @@ export async function clearChatHistory(chatId: string) {
     pendingMemoryCandidates: [],
     forceSupervisorReroute: false,
     rerouteReason: "",
+    confirmationDecision: "",
   });
 
   logger.info("Chat history cleared", {
@@ -818,10 +843,11 @@ export async function clearChatHistory(chatId: string) {
     resetState: {
       summary: "",
       messagesCount: 0,
-      messagesSinceLastMemorySave: 0,
+      tokensSinceLastMemorySave: 0,
       pendingMemoryCandidates: [],
       forceSupervisorReroute: false,
       rerouteReason: "",
+      confirmationDecision: "",
     },
   });
 
