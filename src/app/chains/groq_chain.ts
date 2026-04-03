@@ -699,19 +699,25 @@ const workflow = new StateGraph(GraphState)
 
   .addConditionalEdges("recorder", (state) => {
     if (state.forceSupervisorReroute) return "supervisor";
-    const toolCall = getPrimaryToolCall(state.messages);
+    const lastMessage = state.messages[state.messages.length - 1];
+    if (!(lastMessage instanceof AIMessage)) return END;
+    const toolCall = (lastMessage as AIMessage).tool_calls?.[0] ?? null;
     if (!toolCall) return END;
     return needsConfirmation(toolCall.name) ? "confirm_tool" : "tools";
   })
   .addConditionalEdges("split_bill", (state) => {
     if (state.forceSupervisorReroute) return "supervisor";
-    const toolCall = getPrimaryToolCall(state.messages);
+    const lastMessage = state.messages[state.messages.length - 1];
+    if (!(lastMessage instanceof AIMessage)) return END;
+    const toolCall = (lastMessage as AIMessage).tool_calls?.[0] ?? null;
     if (!toolCall) return END;
     return needsConfirmation(toolCall.name) ? "confirm_tool" : "tools";
   })
   .addConditionalEdges("general_chat", (state) => {
     if (state.forceSupervisorReroute) return "supervisor";
-    const toolCall = getPrimaryToolCall(state.messages);
+    const lastMessage = state.messages[state.messages.length - 1];
+    if (!(lastMessage instanceof AIMessage)) return END;
+    const toolCall = (lastMessage as AIMessage).tool_calls?.[0] ?? null;
     if (!toolCall) return END;
     return needsConfirmation(toolCall.name) ? "confirm_tool" : "tools";
   })
