@@ -1,4 +1,3 @@
-// src/app/chains/groq_chain.ts
 import { ChatGroq } from "@langchain/groq";
 import {
   BaseMessage,
@@ -36,20 +35,18 @@ import {
   shouldSummarizeMessages,
   shouldCondenseSummary,
 } from "@/app/chains/context-budget.js";
+import { getLogger, truncateForLog } from "@/lib/logger.js";
 import { getMcpTools } from "@/lib/mcp.js";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { StructuredTool } from "@langchain/core/tools";
 
-// Definisi tipe data khusus agar tidak pakai 'any'
+const logger = getLogger("chain");
+
 interface ReplaceableMessages extends Array<BaseMessage> {
   _replace?: boolean;
 }
 
 const LONG_TERM_MEMORY_CHECKPOINT_EVERY = 3000;
-
-function logMemoryEvent(eventName: string, payload: Record<string, unknown>) {
-  console.log(`[${eventName}]`, payload);
-}
 
 function getEmptyAgentFallback(agentName: string) {
   if (agentName === "GENERAL_CHAT") {
@@ -70,7 +67,6 @@ function finalizeShortTermSummary(nextSummary: string, previousSummary: string) 
   return cleaned || previousSummary;
 }
 
-// 1. Struktur State
 const GraphState = Annotation.Root({
   messages: Annotation<ReplaceableMessages>({
     reducer: (x, y) => {
@@ -105,17 +101,74 @@ const GraphState = Annotation.Root({
   }),
 });
 
+function summarizePendingCandidates(candidates: PendingMemoryCandidate[]) {
+  return candidates.map((candidate) => ({
+    candidateKey: candidate.candidateKey,
+    memoryType: candidate.memoryType,
+    category: candidate.category,
+    canonicalKey: candidate.canonicalKey,
+    seenCount: candidate.seenCount,
+    checkpointCount: candidate.checkpointCount,
+    importanceScore: candidate.importanceScore,
+    confidence: candidate.confidence,
+    contentPreview: truncateForLog(candidate.content, 160),
+  }));
+}
+
+function summarizeMessagesForLog(messages: BaseMessage[]) {
+  return messages.slice(-RECENT_RAW_TAIL_COUNT).map((message) => ({
+    type: message.getType(),
+    textPreview: truncateForLog(message.content.toString(), 160),
+  }));
+}
+
+function summarizeStateSnapshot(state: typeof GraphState.State) {
+  return {
+    summaryPreview: truncateForLog(state.summary || "", 220),
+    next: state.next,
+    messagesCount: state.messages.length,
+    messagesSinceLastMemorySave: state.messagesSinceLastMemorySave,
+    pendingMemoryCandidates: summarizePendingCandidates(state.pendingMemoryCandidates),
+    forceSupervisorReroute: state.forceSupervisorReroute,
+    rerouteReason: state.rerouteReason,
+    recentMessages: summarizeMessagesForLog(state.messages),
+  };
+}
+
+function summarizeSummaryChange(previousSummary: string, nextSummary: string) {
+  return {
+    previousSummaryPreview: truncateForLog(previousSummary || "", 220),
+    nextSummaryPreview: truncateForLog(nextSummary || "", 220),
+  };
+}
+
+function summarizeError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+
+  return { value: String(error) };
+}
+
+function logMemoryEvent(eventName: string, payload: Record<string, unknown>) {
+  logger.info(eventName, {
+    eventName,
+    ...payload,
+  });
+}
+
 const modelRaw = new ChatGroq({
   apiKey: process.env.GROQ_API_KEY!,
-  // model: "qwen/qwen3-32b",
   model: "openai/gpt-oss-20b",
   temperature: 0.7,
 });
 
-// Load tools
 const allMcpTools = await getMcpTools();
 
-// Pisahkan tools untuk agent spesifik
 const recorderTools = allMcpTools.filter((t) =>
   [
     "add_transaction",
@@ -137,13 +190,8 @@ const splitBillTools = allMcpTools.filter((t) =>
 );
 const generalChatTools = allMcpTools.filter((t) => ["search_memory"].includes(t.name));
 
-// --- NODES ---
-
-// 1. Supervisor Node: Menentukan agen mana yang harus dipanggil
 const supervisorNode = async (state: typeof GraphState.State) => {
   const options = ["RECORDER", "SPLIT_BILL", "GENERAL_CHAT"];
-
-  const modelWithRouting = modelRaw;
 
   const now = new Date();
   const dateStr = now.toLocaleDateString("id-ID", {
@@ -163,7 +211,7 @@ const supervisorNode = async (state: typeof GraphState.State) => {
     ),
   ];
 
-  const response = await modelWithRouting.invoke(prompt);
+  const response = await modelRaw.invoke(prompt);
   const decision = cleanAIResponse(response.content.toString()).toUpperCase();
 
   let next = "general_chat";
@@ -171,11 +219,15 @@ const supervisorNode = async (state: typeof GraphState.State) => {
   if (decision.includes("SPLIT_BILL")) next = "split_bill";
   if (decision.includes("GENERAL_CHAT")) next = "general_chat";
 
-  console.log(`🚀 Supervisor mengarahkan ke: ${next}`);
+  logger.info("Supervisor selected next agent", {
+    eventName: "SUPERVISOR_ROUTING_DECISION",
+    next,
+    state: summarizeStateSnapshot(state),
+  });
+
   return { next, forceSupervisorReroute: false, rerouteReason: "" };
 };
 
-// 2. Agen Nodes
 const createAgentNode = (
   agentName: string,
   agentPrompt: string,
@@ -188,9 +240,14 @@ const createAgentNode = (
     config: LangGraphRunnableConfig,
   ) => {
     const chatId = config.configurable?.thread_id || "unknown";
-    console.log(
-      `🤖 Agen [${agentName}] dipanggil dengan ${tools.length} alat.`,
-    );
+
+    logger.info("Agent invoked", {
+      eventName: "AGENT_INVOKED",
+      agentName,
+      chatId,
+      toolNames: tools.map((tool) => tool.name),
+      state: summarizeStateSnapshot(state),
+    });
 
     const now = new Date();
     const dateStr = now.toLocaleDateString("id-ID", {
@@ -223,15 +280,24 @@ ID CHAT: ${chatId}
     } catch (error) {
       const unavailableToolName = extractUnavailableToolName(error);
       if (unavailableToolName) {
-        console.warn(
-          `⚠️ Agent ${agentName} mencoba tool di luar scope: ${unavailableToolName}. Reroute ke supervisor.`,
-        );
+        logger.warn("Agent tried to call unavailable tool and will reroute", {
+          eventName: "AGENT_REROUTE_UNAVAILABLE_TOOL",
+          agentName,
+          chatId,
+          unavailableToolName,
+        });
         return {
           forceSupervisorReroute: true,
           rerouteReason: `Agent ${agentName} salah memilih tool ${unavailableToolName}. Pilih agent lain yang memang punya tool itu.`,
         };
       }
 
+      logger.error("Agent invocation failed", {
+        eventName: "AGENT_INVOKE_FAILED",
+        agentName,
+        chatId,
+        error: summarizeError(error),
+      });
       throw error;
     }
 
@@ -239,6 +305,14 @@ ID CHAT: ${chatId}
       const cleanedContent = cleanAIResponse(response.content.toString()).trim();
       response.content = cleanedContent || getEmptyAgentFallback(agentName);
     }
+
+    logger.info("Agent completed", {
+      eventName: "AGENT_COMPLETED",
+      agentName,
+      chatId,
+      toolCallNames: (response.tool_calls ?? []).map((toolCall) => toolCall.name),
+      contentPreview: truncateForLog(response.content.toString(), 220),
+    });
 
     return {
       messages: [response],
@@ -286,6 +360,8 @@ const summarizeMessages = async (
       pendingCandidateCount: pendingMemoryCandidates.length,
       tokensSinceLastMemorySave,
       nextCheckpointCounter: nextCounter,
+      previousSummaryPreview: truncateForLog(summary || "", 220),
+      droppedMessages: summarizeMessagesForLog(droppedMessages),
     });
 
     const summaryInput = await SUMMARIZE_PROMPT_TEMPLATE.invoke({
@@ -303,9 +379,14 @@ const summarizeMessages = async (
         chatId,
         summaryTokens: estimateSummaryTokens(nextSummary),
       });
-      const condenseInput = await CONDENSE_SUMMARY_PROMPT_TEMPLATE.invoke({ summary: nextSummary });
+      const condenseInput = await CONDENSE_SUMMARY_PROMPT_TEMPLATE.invoke({
+        summary: nextSummary,
+      });
       const condenseResponse = await modelRaw.invoke(condenseInput);
-      nextSummary = finalizeShortTermSummary(condenseResponse.content.toString(), nextSummary);
+      nextSummary = finalizeShortTermSummary(
+        condenseResponse.content.toString(),
+        nextSummary,
+      );
       logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_CONDENSE_DONE", {
         chatId,
         summaryTokens: estimateSummaryTokens(nextSummary),
@@ -316,6 +397,7 @@ const summarizeMessages = async (
       chatId,
       summaryTokens: estimateSummaryTokens(nextSummary),
       keptRawMessageCount: RECENT_RAW_TAIL_COUNT,
+      ...summarizeSummaryChange(summary, nextSummary),
     });
 
     let nextMemorySaveCounter = nextCounter;
@@ -326,6 +408,7 @@ const summarizeMessages = async (
           chatId,
           checkpointCounter: nextCounter,
           threshold: LONG_TERM_MEMORY_CHECKPOINT_EVERY,
+          pendingMemoryCandidates: summarizePendingCandidates(pendingMemoryCandidates),
         });
 
         const extraction = await extractCheckpointMemories({
@@ -345,6 +428,8 @@ const summarizeMessages = async (
           hasEpisodeSummary: Boolean(extraction.episodeSummary),
           pendingCount: pendingCandidates.length,
           promotedCount: promotedCandidates.length,
+          pendingMemoryCandidates: summarizePendingCandidates(pendingCandidates),
+          promotedCandidates: summarizePendingCandidates(promotedCandidates),
         });
 
         await persistPromotedMemories(chatId, promotedCandidates);
@@ -354,14 +439,30 @@ const summarizeMessages = async (
           chatId,
           pendingCount: nextPendingMemoryCandidates.length,
           promotedCount: promotedCandidates.length,
+          messagesSinceLastMemorySave: nextMemorySaveCounter,
         });
       } catch (error) {
-        console.error("[MEMORY_LONG_TERM_CHECKPOINT_FAILED]", { chatId, error });
+        logger.error("Long-term memory checkpoint failed", {
+          eventName: "MEMORY_LONG_TERM_CHECKPOINT_FAILED",
+          chatId,
+          error: summarizeError(error),
+        });
       }
     }
 
     const trimmedMessages: ReplaceableMessages = messages.slice(-RECENT_RAW_TAIL_COUNT);
     trimmedMessages._replace = true;
+
+    logMemoryEvent("MEMORY_STATE_AFTER_SUMMARY", {
+      chatId,
+      state: {
+        summaryPreview: truncateForLog(nextSummary, 220),
+        messagesCount: trimmedMessages.length,
+        messagesSinceLastMemorySave: nextMemorySaveCounter,
+        pendingMemoryCandidates: summarizePendingCandidates(nextPendingMemoryCandidates),
+        recentMessages: summarizeMessagesForLog(trimmedMessages),
+      },
+    });
 
     return {
       summary: nextSummary,
@@ -445,12 +546,49 @@ export const app = workflow.compile({ checkpointer });
 
 export async function runNaturalChat(chatId: string, userInput: string) {
   const config = { configurable: { thread_id: chatId } };
-  const output = await app.invoke(
-    { messages: [new HumanMessage(userInput)] },
-    config,
-  );
-  const lastMessage = output.messages[output.messages.length - 1];
-  return lastMessage?.content.toString().trim() || "Maaf, jawabanku tadi kosong. Coba ulang ya.";
+
+  logger.info("Starting app invoke", {
+    eventName: "APP_INVOKE_START",
+    chatId,
+    userInputPreview: truncateForLog(userInput, 250),
+  });
+
+  try {
+    const output = await app.invoke(
+      { messages: [new HumanMessage(userInput)] },
+      config,
+    );
+    const lastMessage = output.messages[output.messages.length - 1];
+
+    logger.info("App invoke completed", {
+      eventName: "APP_INVOKE_DONE",
+      chatId,
+      outputState: {
+        summaryPreview: truncateForLog(output.summary || "", 220),
+        next: output.next,
+        messagesCount: output.messages.length,
+        messagesSinceLastMemorySave: output.messagesSinceLastMemorySave,
+        pendingMemoryCandidates: summarizePendingCandidates(output.pendingMemoryCandidates),
+        recentMessages: summarizeMessagesForLog(output.messages),
+      },
+      response: {
+        lastMessageType: lastMessage?.constructor?.name ?? null,
+        lastMessagePreview: lastMessage
+          ? truncateForLog(lastMessage.content.toString(), 250)
+          : null,
+      },
+    });
+
+    return lastMessage?.content.toString().trim() || "Maaf, jawabanku tadi kosong. Coba ulang ya.";
+  } catch (error) {
+    logger.error("App invoke failed", {
+      eventName: "APP_INVOKE_FAILED",
+      chatId,
+      userInputPreview: truncateForLog(userInput, 250),
+      error: summarizeError(error),
+    });
+    throw error;
+  }
 }
 
 export async function clearChatHistory(chatId: string) {
@@ -463,5 +601,19 @@ export async function clearChatHistory(chatId: string) {
     forceSupervisorReroute: false,
     rerouteReason: "",
   });
+
+  logger.info("Chat history cleared", {
+    eventName: "APP_CLEAR_CHAT_HISTORY",
+    chatId,
+    resetState: {
+      summary: "",
+      messagesCount: 0,
+      messagesSinceLastMemorySave: 0,
+      pendingMemoryCandidates: [],
+      forceSupervisorReroute: false,
+      rerouteReason: "",
+    },
+  });
+
   return "Sesi berhasil direset!";
 }

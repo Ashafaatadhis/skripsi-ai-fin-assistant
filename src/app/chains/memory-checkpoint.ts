@@ -2,7 +2,10 @@ import { BaseMessage } from "@langchain/core/messages";
 import { ChatGroq } from "@langchain/groq";
 import { MEMORY_CHECKPOINT_PROMPT_TEMPLATE } from "@/app/chains/prompt.js";
 import { cleanAIResponse, getMessageText } from "@/app/chains/clarification.js";
+import { getLogger, truncateForLog } from "@/lib/logger.js";
 import { getMcpClient } from "@/lib/mcp.js";
+
+const logger = getLogger("memory");
 
 export type FactCategory =
   | "profile"
@@ -81,6 +84,58 @@ function stripJsonFence(text: string) {
     .replace(/^```\s*/i, "")
     .replace(/```$/i, "")
     .trim();
+}
+
+function summarizeCandidate(candidate: PendingMemoryCandidate) {
+  return {
+    candidateKey: candidate.candidateKey,
+    memoryType: candidate.memoryType,
+    category: candidate.category,
+    canonicalKey: candidate.canonicalKey,
+    seenCount: candidate.seenCount,
+    checkpointCount: candidate.checkpointCount,
+    importanceScore: candidate.importanceScore,
+    confidence: candidate.confidence,
+    contentPreview: truncateForLog(candidate.content, 160),
+  };
+}
+
+function summarizeExtraction(extraction: MemoryCheckpointExtraction) {
+  return {
+    facts: extraction.facts.map((fact) => ({
+      category: fact.category,
+      canonicalKey: fact.canonicalKey,
+      confidence: fact.confidence,
+      importanceScore: fact.importanceScore,
+      contentPreview: truncateForLog(fact.content, 160),
+    })),
+    episodeSummary: extraction.episodeSummary
+      ? {
+          topicKey: extraction.episodeSummary.topicKey,
+          importanceScore: extraction.episodeSummary.importanceScore,
+          contentPreview: truncateForLog(extraction.episodeSummary.content, 160),
+        }
+      : null,
+  };
+}
+
+function summarizeRecentMessages(messages: BaseMessage[]) {
+  return messages.slice(-6).map((message) => ({
+    type: message.getType(),
+    textPreview: truncateForLog(getMessageText(message), 160),
+  }));
+}
+
+function summarizeSaveArguments(candidate: PendingMemoryCandidate, chatId: string) {
+  return {
+    chatId,
+    memoryType: candidate.memoryType,
+    category: candidate.category,
+    canonicalKey: candidate.canonicalKey,
+    importanceScore: candidate.importanceScore,
+    confidence: candidate.confidence,
+    contentPreview: truncateForLog(candidate.content, 160),
+  };
 }
 
 export function formatRecentMessages(messages: BaseMessage[]) {
@@ -167,29 +222,25 @@ export function buildPendingMemoryCandidates(
   extraction: MemoryCheckpointExtraction,
   nowIso: string,
 ) {
-  const candidates: PendingMemoryCandidate[] = extraction.facts.map((fact) => {
-    const candidate: PendingMemoryCandidate = {
-      candidateKey: getCandidateKey({
-        memoryType: "fact",
-        canonicalKey: fact.canonicalKey,
-        content: fact.content,
-      }),
+  const candidates: PendingMemoryCandidate[] = extraction.facts.map((fact) => ({
+    candidateKey: getCandidateKey({
       memoryType: "fact",
-      category: fact.category,
-      content: fact.content,
       canonicalKey: fact.canonicalKey,
-      firstSeenAt: nowIso,
-      lastSeenAt: nowIso,
-      seenCount: 1,
-      checkpointCount: 1,
-      ...(fact.confidence !== undefined ? { confidence: fact.confidence } : {}),
-      ...(fact.importanceScore !== undefined
-        ? { importanceScore: fact.importanceScore }
-        : {}),
-    };
-
-    return candidate;
-  });
+      content: fact.content,
+    }),
+    memoryType: "fact",
+    category: fact.category,
+    content: fact.content,
+    canonicalKey: fact.canonicalKey,
+    firstSeenAt: nowIso,
+    lastSeenAt: nowIso,
+    seenCount: 1,
+    checkpointCount: 1,
+    ...(fact.confidence !== undefined ? { confidence: fact.confidence } : {}),
+    ...(fact.importanceScore !== undefined
+      ? { importanceScore: fact.importanceScore }
+      : {}),
+  }));
 
   if (extraction.episodeSummary) {
     candidates.push({
@@ -221,6 +272,12 @@ export function updatePendingMemoryCandidates(
   extraction: MemoryCheckpointExtraction,
   nowIso: string,
 ) {
+  logger.info("Updating pending memory candidates", {
+    eventName: "MEMORY_PENDING_UPDATE_START",
+    existingCandidateCount: existingCandidates.length,
+    extraction: summarizeExtraction(extraction),
+  });
+
   const merged = new Map(
     existingCandidates.map((candidate) => [
       candidate.candidateKey,
@@ -261,6 +318,10 @@ export function updatePendingMemoryCandidates(
 
   for (const candidate of merged.values()) {
     if (shouldDiscardCandidate(candidate, nowIso)) {
+      logger.info("Discarding pending memory candidate", {
+        eventName: "MEMORY_PENDING_CANDIDATE_DISCARDED",
+        candidate: summarizeCandidate(candidate),
+      });
       continue;
     }
 
@@ -287,6 +348,12 @@ export function updatePendingMemoryCandidates(
       return Date.parse(right.lastSeenAt) - Date.parse(left.lastSeenAt);
     })
     .slice(0, MAX_PENDING_MEMORY_CANDIDATES);
+
+  logger.info("Pending memory candidates updated", {
+    eventName: "MEMORY_PENDING_UPDATE_DONE",
+    pendingCandidates: trimmedPendingCandidates.map(summarizeCandidate),
+    promotedCandidates: promotedCandidates.map(summarizeCandidate),
+  });
 
   return { pendingCandidates: trimmedPendingCandidates, promotedCandidates };
 }
@@ -326,7 +393,8 @@ export async function persistPromotedMemories(
   promotedCandidates: PendingMemoryCandidate[],
 ) {
   if (promotedCandidates.length === 0) {
-    console.log("[MEMORY_LONG_TERM_MEMORY_SAVED]", {
+    logger.info("No promoted memories to save", {
+      eventName: "MEMORY_LONG_TERM_MEMORY_SAVED",
       chatId,
       savedCount: 0,
     });
@@ -337,6 +405,11 @@ export async function persistPromotedMemories(
   let savedCount = 0;
 
   for (const candidate of promotedCandidates) {
+    logger.info("Saving promoted memory candidate", {
+      eventName: "MEMORY_LONG_TERM_SAVE_REQUEST",
+      payload: summarizeSaveArguments(candidate, chatId),
+    });
+
     if (candidate.memoryType === "fact") {
       await client.callTool({
         name: "save_memory",
@@ -356,6 +429,10 @@ export async function persistPromotedMemories(
     }
 
     if ((candidate.importanceScore ?? 0) < EPISODE_PROMOTION_MIN_IMPORTANCE) {
+      logger.info("Skipping episode summary below importance threshold", {
+        eventName: "MEMORY_LONG_TERM_SAVE_SKIPPED",
+        candidate: summarizeCandidate(candidate),
+      });
       continue;
     }
 
@@ -378,10 +455,12 @@ export async function persistPromotedMemories(
     savedCount += 1;
   }
 
-  console.log("[MEMORY_LONG_TERM_MEMORY_SAVED]", {
+  logger.info("Promoted memories saved", {
+    eventName: "MEMORY_LONG_TERM_MEMORY_SAVED",
     chatId,
     promotedCount: promotedCandidates.length,
     savedCount,
+    promotedCandidates: promotedCandidates.map(summarizeCandidate),
   });
 }
 
@@ -394,15 +473,25 @@ export async function extractCheckpointMemories({
   recentMessages: BaseMessage[];
   model: ChatGroq;
 }) {
+  logger.info("Extracting checkpoint memories", {
+    eventName: "MEMORY_LONG_TERM_EXTRACTION_START",
+    summaryPreview: truncateForLog(summary, 200),
+    recentMessages: summarizeRecentMessages(recentMessages),
+  });
+
   const prompt = await MEMORY_CHECKPOINT_PROMPT_TEMPLATE.invoke({
     summary,
     recentMessages: formatRecentMessages(recentMessages),
   });
   const response = await model.invoke(prompt);
-  const extraction = parseMemoryCheckpointResponse(response.content.toString());
-  console.log("[MEMORY_LONG_TERM_CHECKPOINT_EXTRACTED]", {
-    factCount: extraction.facts.length,
-    hasEpisodeSummary: Boolean(extraction.episodeSummary),
+  const rawText = response.content.toString();
+  const extraction = parseMemoryCheckpointResponse(rawText);
+
+  logger.info("Checkpoint memories extracted", {
+    eventName: "MEMORY_LONG_TERM_CHECKPOINT_EXTRACTED",
+    rawResponsePreview: truncateForLog(rawText, 300),
+    extraction: summarizeExtraction(extraction),
   });
+
   return extraction;
 }

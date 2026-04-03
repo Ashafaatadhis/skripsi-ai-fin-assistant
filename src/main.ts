@@ -3,11 +3,16 @@ import "dotenv/config";
 import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
 import { handlePhotoMessage, handleTextMessage } from "@/app/bot/handlers.js";
+import { getLogger } from "@/lib/logger.js";
+
+const logger = getLogger("main");
 
 // Pastikan BOT_TOKEN ada sebelum bot dinyalakan
 const token = process.env.BOT_TOKEN!;
 if (!token) {
-  console.error("❌ ERROR: BOT_TOKEN tidak ditemukan di file .env");
+  logger.error("BOT_TOKEN tidak ditemukan di file .env", {
+    eventName: "BOT_TOKEN_MISSING",
+  });
   process.exit(1);
 }
 
@@ -27,19 +32,35 @@ bot.on(message("text"), handleTextMessage);
 bot.on(message("photo"), handlePhotoMessage);
 
 // 4. Launch Bot dengan Penanganan Error
-console.log("⌛ Sedang menyambungkan ke Telegram...");
+logger.info("Sedang menyambungkan ke Telegram", {
+  eventName: "BOT_LAUNCH_START",
+});
+
 bot
   .launch()
   .then(() => {
-    console.log("-----------------------------------------");
-    console.log("🚀 AI Financial Assistant IS RUNNING");
-    console.log("🤖 Bot: @" + bot.botInfo?.username);
-    console.log("-----------------------------------------");
+    logger.info("AI Financial Assistant is running", {
+      eventName: "BOT_LAUNCH_SUCCESS",
+      username: bot.botInfo?.username ?? null,
+    });
   })
   .catch((err) => {
-    console.error("❌ Gagal menjalankan bot:", err);
+    logger.error("Gagal menjalankan bot", {
+      eventName: "BOT_LAUNCH_FAILED",
+      error: err,
+    });
   });
 
 // 5. Graceful Shutdown
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+process.once("SIGINT", () => {
+  logger.info("Received SIGINT, stopping bot", {
+    eventName: "BOT_STOP_SIGINT",
+  });
+  bot.stop("SIGINT");
+});
+process.once("SIGTERM", () => {
+  logger.info("Received SIGTERM, stopping bot", {
+    eventName: "BOT_STOP_SIGTERM",
+  });
+  bot.stop("SIGTERM");
+});
