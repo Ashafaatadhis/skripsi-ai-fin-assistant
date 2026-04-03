@@ -45,7 +45,7 @@ interface ReplaceableMessages extends Array<BaseMessage> {
   _replace?: boolean;
 }
 
-const LONG_TERM_MEMORY_CHECKPOINT_EVERY = 30;
+const LONG_TERM_MEMORY_CHECKPOINT_EVERY = 3000;
 
 function logMemoryEvent(eventName: string, payload: Record<string, unknown>) {
   console.log(`[${eventName}]`, payload);
@@ -87,7 +87,7 @@ const GraphState = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => "supervisor",
   }),
-  messagesSinceLastMemorySave: Annotation<number>({
+  tokensSinceLastMemorySave: Annotation<number>({
     reducer: (x, y) => y ?? x,
     default: () => 0,
   }),
@@ -266,7 +266,7 @@ const summarizeMessages = async (
   state: typeof GraphState.State,
   config: LangGraphRunnableConfig,
 ) => {
-  const { messages, summary, messagesSinceLastMemorySave, pendingMemoryCandidates } = state;
+  const { messages, summary, tokensSinceLastMemorySave, pendingMemoryCandidates } = state;
   if (shouldSummarizeMessages(messages)) {
     const chatId = config.configurable?.thread_id || "unknown";
     const droppedMessages = messages.slice(0, -RECENT_RAW_TAIL_COUNT);
@@ -274,15 +274,17 @@ const summarizeMessages = async (
       return {};
     }
 
-    const nextCounter = messagesSinceLastMemorySave + droppedMessages.length;
+    const droppedTokens = estimateMessagesTokens(droppedMessages);
+    const nextCounter = tokensSinceLastMemorySave + droppedTokens;
     logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_TRIGGER", {
       chatId,
       messageCount: messages.length,
       droppedMessageCount: droppedMessages.length,
+      droppedTokens,
       messagesTokens: estimateMessagesTokens(messages),
       summaryTokens: estimateSummaryTokens(summary),
       pendingCandidateCount: pendingMemoryCandidates.length,
-      messagesSinceLastMemorySave,
+      tokensSinceLastMemorySave,
       nextCheckpointCounter: nextCounter,
     });
 
@@ -364,7 +366,7 @@ const summarizeMessages = async (
     return {
       summary: nextSummary,
       messages: trimmedMessages,
-      messagesSinceLastMemorySave: nextMemorySaveCounter,
+      tokensSinceLastMemorySave: nextMemorySaveCounter,
       pendingMemoryCandidates: nextPendingMemoryCandidates,
     };
   }
@@ -456,7 +458,7 @@ export async function clearChatHistory(chatId: string) {
   await app.updateState(config, {
     messages: [],
     summary: "",
-    messagesSinceLastMemorySave: 0,
+    tokensSinceLastMemorySave: 0,
     pendingMemoryCandidates: [],
     forceSupervisorReroute: false,
     rerouteReason: "",
