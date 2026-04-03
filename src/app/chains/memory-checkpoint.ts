@@ -283,10 +283,7 @@ export function updatePendingMemoryCandidates(
 
 function shouldPromoteCandidate(candidate: PendingMemoryCandidate) {
   if (candidate.memoryType === "fact") {
-    return (
-      candidate.seenCount >= FACT_PROMOTION_MIN_SEEN ||
-      candidate.checkpointCount >= FACT_PROMOTION_MAX_CHECKPOINTS
-    );
+    return candidate.seenCount >= FACT_PROMOTION_MIN_SEEN;
   }
 
   return (

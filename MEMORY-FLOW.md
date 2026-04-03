@@ -402,21 +402,21 @@ Function terkait:
 
 ### Promote Fact
 
-Fact dipromote kalau salah satu terpenuhi:
+Fact dipromote kalau:
 - `seenCount >= 2`
-- atau `checkpointCount >= 2`
 
-Artinya fact cukup cepat bisa naik ke long-term.
+Artinya fact tidak boleh auto-promote hanya karena bertahan hidup di pending.
+Fact harus benar-benar muncul lagi atau terkonfirmasi lagi.
 
 Contoh:
 - checkpoint 1: `Nama user adalah Adhis.` muncul -> pending
 - checkpoint 2: kandidat yang sama muncul lagi -> `seenCount = 2`
 - hasil: promote
 
-Atau:
+Kalau fact hanya bertahan hidup tanpa muncul lagi:
 - checkpoint 1: muncul sekali
-- checkpoint 2: tidak muncul lagi tapi masih tetap hidup di pending -> `checkpointCount = 2`
-- hasil: tetap bisa promote
+- checkpoint 2: tidak muncul lagi -> `checkpointCount = 2`
+- hasil: tetap pending, belum promote
 
 Contoh bentuk candidate yang sudah promote:
 
@@ -424,6 +424,16 @@ Contoh bentuk candidate yang sudah promote:
 {
   candidateKey: "fact:profile.name",
   seenCount: 2,
+  checkpointCount: 2
+}
+```
+
+Contoh fact yang masih pending walau sudah hidup 2 checkpoint:
+
+```ts
+{
+  candidateKey: "fact:profile.name",
+  seenCount: 1,
   checkpointCount: 2
 }
 ```
@@ -461,6 +471,11 @@ Aturannya:
 ### Fact dibuang kalau:
 - `checkpointCount > 4`
 - atau umur candidate lebih dari 14 hari
+
+Artinya fact sekarang punya jalur seperti ini:
+- muncul sekali -> pending
+- kalau muncul lagi -> promote
+- kalau tidak pernah muncul lagi dan terus hidup di pending -> akhirnya dibuang
 
 ### Episode summary dibuang kalau:
 - `checkpointCount > 5`

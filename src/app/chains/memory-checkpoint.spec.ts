@@ -67,6 +67,27 @@ test("updatePendingMemoryCandidates promotes repeated candidates", () => {
   assert.equal(promotedCandidates[0]?.seenCount, 2);
 });
 
+test("updatePendingMemoryCandidates keeps fact pending if it only survives one extra checkpoint", () => {
+  const extraction = parseMemoryCheckpointResponse(`
+    {"facts":[{"category":"profile","canonicalKey":"profile.name","content":"Nama user adalah Adhis.","confidence":0.9,"importanceScore":0.8}],"episodeSummary":null}
+  `);
+
+  const firstPending = buildPendingMemoryCandidates(
+    extraction,
+    "2026-04-02T10:00:00.000Z",
+  );
+  const nextResult = updatePendingMemoryCandidates(
+    firstPending,
+    { facts: [], episodeSummary: null },
+    "2026-04-02T11:00:00.000Z",
+  );
+
+  assert.equal(nextResult.promotedCandidates.length, 0);
+  assert.equal(nextResult.pendingCandidates.length, 1);
+  assert.equal(nextResult.pendingCandidates[0]?.memoryType, "fact");
+  assert.equal(nextResult.pendingCandidates[0]?.checkpointCount, 2);
+});
+
 test("updatePendingMemoryCandidates keeps episode summary pending longer", () => {
   const extraction = parseMemoryCheckpointResponse(`
     {"facts":[],"episodeSummary":{"content":"User sedang bingung mengatur uang bulan ini dan butuh bantuan yang lebih terstruktur.","importanceScore":0.7}}
