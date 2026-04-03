@@ -4,12 +4,15 @@ import {
   AIMessage,
   HumanMessage,
   SystemMessage,
+  ToolMessage,
 } from "@langchain/core/messages";
 import {
   Annotation,
+  Command,
   StateGraph,
   START,
   END,
+  interrupt,
   type LangGraphRunnableConfig,
 } from "@langchain/langgraph";
 import {
@@ -99,6 +102,10 @@ const GraphState = Annotation.Root({
     reducer: (_x, y) => y ?? _x,
     default: () => "",
   }),
+  confirmationDecision: Annotation<string>({
+    reducer: (_x, y) => y ?? _x,
+    default: () => "",
+  }),
 });
 
 function summarizePendingCandidates(candidates: PendingMemoryCandidate[]) {
@@ -127,7 +134,7 @@ function summarizeStateSnapshot(state: typeof GraphState.State) {
     summaryPreview: truncateForLog(state.summary || "", 220),
     next: state.next,
     messagesCount: state.messages.length,
-    messagesSinceLastMemorySave: state.messagesSinceLastMemorySave,
+    tokensSinceLastMemorySave: state.tokensSinceLastMemorySave,
     pendingMemoryCandidates: summarizePendingCandidates(state.pendingMemoryCandidates),
     forceSupervisorReroute: state.forceSupervisorReroute,
     rerouteReason: state.rerouteReason,
@@ -159,6 +166,116 @@ function logMemoryEvent(eventName: string, payload: Record<string, unknown>) {
     eventName,
     ...payload,
   });
+}
+
+function formatCurrency(value: unknown) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "-";
+  }
+
+  return `Rp ${value.toLocaleString("id-ID")}`;
+}
+
+function getLastToolCallingAIMessage(messages: BaseMessage[]) {
+  return [...messages]
+    .reverse()
+    .find(
+      (message) => message instanceof AIMessage && (message as AIMessage).tool_calls?.length,
+    ) as AIMessage | undefined;
+}
+
+function getPrimaryToolCall(messages: BaseMessage[]) {
+  return getLastToolCallingAIMessage(messages)?.tool_calls?.[0] ?? null;
+}
+
+function needsConfirmation(toolName?: string | null) {
+  return ["add_transaction", "split_bill", "settle_debt"].includes(toolName ?? "");
+}
+
+function formatAddTransactionConfirmation(args: Record<string, unknown>) {
+  return [
+    "Konfirmasi pencatatan transaksi:",
+    `- Tipe: ${String(args.type ?? "-")}`,
+    `- Jumlah: ${formatCurrency(args.amount)}`,
+    `- Kategori: ${String(args.category ?? "-")}`,
+    `- Merchant: ${String(args.merchant ?? "-")}`,
+    'Balas "ya" untuk lanjut atau "batal" untuk membatalkan.',
+  ].join("\n");
+}
+
+function formatSplitBillConfirmation(args: Record<string, unknown>) {
+  const participants = Array.isArray(args.participants)
+    ? args.participants.map((value) => String(value)).join(", ")
+    : "-";
+
+  return [
+    "Konfirmasi split bill:",
+    `- Total: ${formatCurrency(args.totalAmount)}`,
+    `- Merchant: ${String(args.merchant ?? "-")}`,
+    `- Peserta: ${participants || "-"}`,
+    'Balas "ya" untuk lanjut atau "batal" untuk membatalkan.',
+  ].join("\n");
+}
+
+function formatSettleDebtConfirmation(args: Record<string, unknown>) {
+  return [
+    "Konfirmasi pelunasan hutang:",
+    `- Debt ID: ${String(args.debtId ?? "-")}`,
+    `- Nama: ${String(args.personName ?? "-")}`,
+    'Balas "ya" untuk lanjut atau "batal" untuk membatalkan.',
+  ].join("\n");
+}
+
+function formatConfirmation(toolCall: { name: string; args?: Record<string, unknown> }) {
+  const args = toolCall.args ?? {};
+  switch (toolCall.name) {
+    case "add_transaction":
+      return formatAddTransactionConfirmation(args);
+    case "split_bill":
+      return formatSplitBillConfirmation(args);
+    case "settle_debt":
+      return formatSettleDebtConfirmation(args);
+    default:
+      return [
+        `Konfirmasi menjalankan tool ${toolCall.name}.`,
+        'Balas "ya" untuk lanjut atau "batal" untuk membatalkan.',
+      ].join("\n");
+  }
+}
+
+function normalizeConfirmationResponse(value: unknown) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function isConfirmed(value: unknown) {
+  return ["ya", "y", "lanjut", "oke"].includes(normalizeConfirmationResponse(value));
+}
+
+function isRejected(value: unknown) {
+  return ["tidak", "ga", "batal", "cancel"].includes(normalizeConfirmationResponse(value));
+}
+
+function buildCancelledConfirmationResult(
+  toolCall: { id?: string; name: string },
+  text: string,
+) {
+  const messages: BaseMessage[] = [];
+  if (toolCall.id) {
+    messages.push(
+      new ToolMessage({
+        content: "[TOOL_CANCELLED] User rejected confirmation.",
+        tool_call_id: toolCall.id,
+      }),
+    );
+  }
+  messages.push(new AIMessage(text));
+
+  return {
+    confirmationDecision: "rejected",
+    messages,
+  };
 }
 
 const modelRaw = new ChatGroq({
@@ -336,6 +453,88 @@ const generalChatNode = createAgentNode(
   generalChatTools,
 );
 
+const confirmToolNode = async (state: typeof GraphState.State) => {
+  const toolCall = getPrimaryToolCall(state.messages);
+  if (!toolCall) {
+    return { confirmationDecision: "missing_tool_call" };
+  }
+
+  const confirmationText = formatConfirmation({
+    name: toolCall.name,
+    args: (toolCall.args ?? {}) as Record<string, unknown>,
+  });
+
+  logger.info("Tool confirmation required", {
+    eventName: "TOOL_CONFIRMATION_REQUIRED",
+    toolName: toolCall.name,
+    toolArgs: toolCall.args ?? {},
+  });
+
+  const firstResponse = interrupt({
+    type: "tool_confirmation",
+    toolName: toolCall.name,
+    prompt: confirmationText,
+    retryCount: 0,
+  });
+
+  if (isConfirmed(firstResponse)) {
+    logger.info("Tool confirmation accepted", {
+      eventName: "TOOL_CONFIRMATION_ACCEPTED",
+      toolName: toolCall.name,
+      userResponse: String(firstResponse ?? ""),
+    });
+    return { confirmationDecision: "confirmed" };
+  }
+
+  if (isRejected(firstResponse)) {
+    logger.info("Tool confirmation rejected", {
+      eventName: "TOOL_CONFIRMATION_REJECTED",
+      toolName: toolCall.name,
+      userResponse: String(firstResponse ?? ""),
+    });
+    return buildCancelledConfirmationResult(
+      toolCall.id
+        ? { id: toolCall.id, name: toolCall.name }
+        : { name: toolCall.name },
+      "Oke, aku batalkan aksinya ya.",
+    );
+  }
+
+  logger.info("Tool confirmation ambiguous, asking once more", {
+    eventName: "TOOL_CONFIRMATION_AMBIGUOUS",
+    toolName: toolCall.name,
+    userResponse: String(firstResponse ?? ""),
+  });
+
+  const secondResponse = interrupt({
+    type: "tool_confirmation",
+    toolName: toolCall.name,
+    prompt: `${confirmationText}\n\nBalas hanya dengan: ya / batal`,
+    retryCount: 1,
+  });
+
+  if (isConfirmed(secondResponse)) {
+    logger.info("Tool confirmation accepted after retry", {
+      eventName: "TOOL_CONFIRMATION_ACCEPTED_AFTER_RETRY",
+      toolName: toolCall.name,
+      userResponse: String(secondResponse ?? ""),
+    });
+    return { confirmationDecision: "confirmed" };
+  }
+
+  logger.info("Tool confirmation cancelled after ambiguous retry", {
+    eventName: "TOOL_CONFIRMATION_CANCELLED_AFTER_RETRY",
+    toolName: toolCall.name,
+    userResponse: String(secondResponse ?? ""),
+  });
+  return buildCancelledConfirmationResult(
+    toolCall.id
+      ? { id: toolCall.id, name: toolCall.name }
+      : { name: toolCall.name },
+    "Aku batalkan dulu ya karena jawabannya belum jelas.",
+  );
+};
+
 const summarizeMessages = async (
   state: typeof GraphState.State,
   config: LangGraphRunnableConfig,
@@ -480,6 +679,7 @@ const workflow = new StateGraph(GraphState)
   .addNode("recorder", recorderNode)
   .addNode("split_bill", splitBillNode)
   .addNode("general_chat", generalChatNode)
+  .addNode("confirm_tool", confirmToolNode)
   .addNode("tools", new ToolNode(allMcpTools))
 
   .addEdge(START, "summarize")
@@ -493,18 +693,25 @@ const workflow = new StateGraph(GraphState)
 
   .addConditionalEdges("recorder", (state) => {
     if (state.forceSupervisorReroute) return "supervisor";
-    const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
-    return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
+    const toolCall = getPrimaryToolCall(state.messages);
+    if (!toolCall) return END;
+    return needsConfirmation(toolCall.name) ? "confirm_tool" : "tools";
   })
   .addConditionalEdges("split_bill", (state) => {
     if (state.forceSupervisorReroute) return "supervisor";
-    const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
-    return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
+    const toolCall = getPrimaryToolCall(state.messages);
+    if (!toolCall) return END;
+    return needsConfirmation(toolCall.name) ? "confirm_tool" : "tools";
   })
   .addConditionalEdges("general_chat", (state) => {
     if (state.forceSupervisorReroute) return "supervisor";
-    const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
-    return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
+    const toolCall = getPrimaryToolCall(state.messages);
+    if (!toolCall) return END;
+    return needsConfirmation(toolCall.name) ? "confirm_tool" : "tools";
+  })
+
+  .addConditionalEdges("confirm_tool", (state) => {
+    return state.confirmationDecision === "confirmed" ? "tools" : END;
   })
 
   .addConditionalEdges("tools", (state) => {
@@ -544,18 +751,21 @@ const workflow = new StateGraph(GraphState)
 const checkpointer = await createInitializedCheckpointer();
 export const app = workflow.compile({ checkpointer });
 
-export async function runNaturalChat(chatId: string, userInput: string) {
+export async function runNaturalChat(chatId: string, userInput: string, options?: { resume?: boolean }) {
   const config = { configurable: { thread_id: chatId } };
+  const isResume = options?.resume === true;
 
   logger.info("Starting app invoke", {
-    eventName: "APP_INVOKE_START",
+    eventName: isResume ? "APP_RESUME_START" : "APP_INVOKE_START",
     chatId,
     userInputPreview: truncateForLog(userInput, 250),
   });
 
   try {
     const output = await app.invoke(
-      { messages: [new HumanMessage(userInput)] },
+      isResume
+        ? new Command({ resume: userInput })
+        : { messages: [new HumanMessage(userInput)] },
       config,
     );
     const lastMessage = output.messages[output.messages.length - 1];
@@ -567,7 +777,7 @@ export async function runNaturalChat(chatId: string, userInput: string) {
         summaryPreview: truncateForLog(output.summary || "", 220),
         next: output.next,
         messagesCount: output.messages.length,
-        messagesSinceLastMemorySave: output.messagesSinceLastMemorySave,
+        tokensSinceLastMemorySave: output.tokensSinceLastMemorySave,
         pendingMemoryCandidates: summarizePendingCandidates(output.pendingMemoryCandidates),
         recentMessages: summarizeMessagesForLog(output.messages),
       },

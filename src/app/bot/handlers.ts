@@ -1,7 +1,7 @@
 // src/app/bot/handlers.ts
 import { Context } from "telegraf";
 import { message } from "telegraf/filters";
-import { clearChatHistory, runNaturalChat } from "@/app/chains/groq_chain.js";
+import { app, clearChatHistory, runNaturalChat } from "@/app/chains/groq_chain.js";
 import { runVisionAnalysis } from "@/app/chains/vision_chain.js";
 import { sanitizeTelegramHtml, stripTelegramHtml } from "@/app/bot/telegram-format.js";
 import { getLogger, truncateForLog } from "@/lib/logger.js";
@@ -44,18 +44,32 @@ export const handleTextMessage = async (ctx: Context) => {
   });
 
   try {
-    // Tampilkan status "typing..." di Telegram biar natural
     await ctx.sendChatAction("typing");
-    // Panggil AI
-    const aiResponse = await runNaturalChat(chatId, userText);
+
+    const config = { configurable: { thread_id: chatId } };
+    const graphState = await app.getState(config);
+    const hasActiveInterrupt = graphState.tasks.some(
+      (task) => (task.interrupts?.length ?? 0) > 0,
+    );
+
+    logger.info("Checked graph interrupt state", {
+      eventName: "BOT_INTERRUPT_STATE_CHECKED",
+      chatId,
+      hasActiveInterrupt,
+      taskCount: graphState.tasks.length,
+    });
+
+    const aiResponse = await runNaturalChat(chatId, userText, {
+      resume: hasActiveInterrupt,
+    });
 
     logger.info("Balasan AI siap dikirim", {
       eventName: "BOT_TEXT_RESPONSE_READY",
       chatId,
       aiResponsePreview: truncateForLog(aiResponse, 250),
+      resumedInterrupt: hasActiveInterrupt,
     });
 
-    // Kirim jawaban ke user
     await replyWithSafeTelegramHtml(ctx, aiResponse);
   } catch (error) {
     logger.error("Groq error saat memproses pesan teks", {
