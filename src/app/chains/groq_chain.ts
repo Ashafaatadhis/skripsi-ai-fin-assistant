@@ -1,9 +1,9 @@
 // src/app/chains/groq_chain.ts
 import { ChatGroq } from "@langchain/groq";
 import {
-  HumanMessage,
   BaseMessage,
   AIMessage,
+  HumanMessage,
   SystemMessage,
 } from "@langchain/core/messages";
 import {
@@ -18,11 +18,21 @@ import {
   SUPERVISOR_PROMPT,
   RECORDER_AGENT_PROMPT,
   SPLIT_BILL_AGENT_PROMPT,
-  MEMORY_AGENT_PROMPT,
   GENERAL_CHAT_AGENT_PROMPT,
   SUMMARIZE_PROMPT_TEMPLATE,
 } from "@/app/chains/prompt.js";
-import { cleanAIResponse, detectClarificationRoute } from "@/app/chains/clarification.js";
+import { cleanAIResponse } from "@/app/chains/clarification.js";
+import {
+  type PendingMemoryCandidate,
+  extractCheckpointMemories,
+  persistPromotedMemories,
+  updatePendingMemoryCandidates,
+} from "@/app/chains/memory-checkpoint.js";
+import {
+  RECENT_RAW_TAIL_COUNT,
+  estimateContextSize,
+  shouldSummarizeMessages,
+} from "@/app/chains/context-budget.js";
 import { getMcpTools } from "@/lib/mcp.js";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { StructuredTool } from "@langchain/core/tools";
@@ -30,6 +40,31 @@ import { StructuredTool } from "@langchain/core/tools";
 // Definisi tipe data khusus agar tidak pakai 'any'
 interface ReplaceableMessages extends Array<BaseMessage> {
   _replace?: boolean;
+}
+
+const LONG_TERM_MEMORY_CHECKPOINT_EVERY = 30;
+
+function logMemoryEvent(eventName: string, payload: Record<string, unknown>) {
+  console.log(`[${eventName}]`, payload);
+}
+
+function getEmptyAgentFallback(agentName: string) {
+  if (agentName === "GENERAL_CHAT") {
+    return "Siap, aku catat konteksnya dulu. Kalau mau, lanjut kasih tahu detail lain tentang kamu ya.";
+  }
+
+  return "Maaf, jawabanku tadi kosong. Coba ulang ya.";
+}
+
+function extractUnavailableToolName(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  const match = message.match(/attempted to call tool '([^']+)' which was not in request\.tools/i);
+  return match?.[1] ?? null;
+}
+
+function finalizeShortTermSummary(nextSummary: string, previousSummary: string) {
+  const cleaned = cleanAIResponse(nextSummary).trim();
+  return cleaned || previousSummary;
 }
 
 // 1. Struktur State
@@ -49,6 +84,22 @@ const GraphState = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => "supervisor",
   }),
+  messagesSinceLastMemorySave: Annotation<number>({
+    reducer: (x, y) => y ?? x,
+    default: () => 0,
+  }),
+  pendingMemoryCandidates: Annotation<PendingMemoryCandidate[]>({
+    reducer: (_x, y) => y ?? _x,
+    default: () => [],
+  }),
+  forceSupervisorReroute: Annotation<boolean>({
+    reducer: (_x, y) => y ?? _x,
+    default: () => false,
+  }),
+  rerouteReason: Annotation<string>({
+    reducer: (_x, y) => y ?? _x,
+    default: () => "",
+  }),
 });
 
 const modelRaw = new ChatGroq({
@@ -63,26 +114,31 @@ const allMcpTools = await getMcpTools();
 
 // Pisahkan tools untuk agent spesifik
 const recorderTools = allMcpTools.filter((t) =>
-  ["add_transaction", "get_balance", "list_transactions", "find_transactions", "get_transaction_by_id"].includes(t.name),
+  [
+    "add_transaction",
+    "get_balance",
+    "list_transactions",
+    "find_transactions",
+    "get_transaction_by_id",
+  ].includes(t.name),
 );
 const splitBillTools = allMcpTools.filter((t) =>
-  ["split_bill", "list_debts", "find_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(t.name),
+  [
+    "split_bill",
+    "list_debts",
+    "find_debts",
+    "settle_debt",
+    "get_debts_by_transaction",
+    "get_debt_detail",
+  ].includes(t.name),
 );
-const memoryTools = allMcpTools.filter((t) =>
-  ["search_memory", "save_memory"].includes(t.name),
-);
+const generalChatTools = allMcpTools.filter((t) => ["search_memory"].includes(t.name));
 
 // --- NODES ---
 
 // 1. Supervisor Node: Menentukan agen mana yang harus dipanggil
 const supervisorNode = async (state: typeof GraphState.State) => {
-  const clarificationRoute = detectClarificationRoute(state.messages);
-  if (clarificationRoute) {
-    console.log(`🧭 Klarifikasi terdeteksi, langsung diarahkan ke: ${clarificationRoute}`);
-    return { next: clarificationRoute };
-  }
-
-  const options = ["RECORDER", "SPLIT_BILL", "MEMORY", "GENERAL_CHAT"];
+  const options = ["RECORDER", "SPLIT_BILL", "GENERAL_CHAT"];
 
   const modelWithRouting = modelRaw;
 
@@ -96,7 +152,7 @@ const supervisorNode = async (state: typeof GraphState.State) => {
 
   const prompt = [
     new SystemMessage(
-      `${SUPERVISOR_PROMPT}\n\nINFO SISTEM:\nTanggal hari ini: ${dateStr}`,
+      `${SUPERVISOR_PROMPT}\n\nINFO SISTEM:\nTanggal hari ini: ${dateStr}${state.forceSupervisorReroute && state.rerouteReason ? `\nREROUTE ERROR: ${state.rerouteReason}` : ""}`,
     ),
     ...state.messages.slice(-6),
     new HumanMessage(
@@ -110,11 +166,10 @@ const supervisorNode = async (state: typeof GraphState.State) => {
   let next = "general_chat";
   if (decision.includes("RECORDER")) next = "recorder";
   if (decision.includes("SPLIT_BILL")) next = "split_bill";
-  if (decision.includes("MEMORY")) next = "memory";
   if (decision.includes("GENERAL_CHAT")) next = "general_chat";
 
   console.log(`🚀 Supervisor mengarahkan ke: ${next}`);
-  return { next };
+  return { next, forceSupervisorReroute: false, rerouteReason: "" };
 };
 
 // 2. Agen Nodes
@@ -159,13 +214,32 @@ ID CHAT: ${chatId}
       ...state.messages.slice(-6),
     ];
 
-    const response = await agentModel.invoke(prompt);
+    let response;
+    try {
+      response = await agentModel.invoke(prompt);
+    } catch (error) {
+      const unavailableToolName = extractUnavailableToolName(error);
+      if (unavailableToolName) {
+        console.warn(
+          `⚠️ Agent ${agentName} mencoba tool di luar scope: ${unavailableToolName}. Reroute ke supervisor.`,
+        );
+        return {
+          forceSupervisorReroute: true,
+          rerouteReason: `Agent ${agentName} salah memilih tool ${unavailableToolName}. Pilih agent lain yang memang punya tool itu.`,
+        };
+      }
 
-    if (!response.tool_calls || response.tool_calls.length === 0) {
-      response.content = cleanAIResponse(response.content.toString());
+      throw error;
     }
 
-    return { messages: [response] };
+    if (!response.tool_calls || response.tool_calls.length === 0) {
+      const cleanedContent = cleanAIResponse(response.content.toString()).trim();
+      response.content = cleanedContent || getEmptyAgentFallback(agentName);
+    }
+
+    return {
+      messages: [response],
+    };
   };
 };
 
@@ -179,31 +253,101 @@ const splitBillNode = createAgentNode(
   SPLIT_BILL_AGENT_PROMPT,
   splitBillTools,
 );
-const memoryNode = createAgentNode("MEMORY", MEMORY_AGENT_PROMPT, memoryTools);
 const generalChatNode = createAgentNode(
   "GENERAL_CHAT",
   GENERAL_CHAT_AGENT_PROMPT,
-  [],
+  generalChatTools,
 );
 
-const summarizeMessages = async (state: typeof GraphState.State) => {
-  const { messages, summary } = state;
-  if (messages.length > 8) {
-    console.log(
-      `🧹 Membersihan memori aktif... (Jumlah pesan: ${messages.length})`,
-    );
+const summarizeMessages = async (
+  state: typeof GraphState.State,
+  config: LangGraphRunnableConfig,
+) => {
+  const { messages, summary, messagesSinceLastMemorySave, pendingMemoryCandidates } = state;
+  if (shouldSummarizeMessages(messages, summary)) {
+    const chatId = config.configurable?.thread_id || "unknown";
+    const droppedMessages = messages.slice(0, -RECENT_RAW_TAIL_COUNT);
+    if (droppedMessages.length === 0) {
+      return {};
+    }
+
+    const nextCounter = messagesSinceLastMemorySave + droppedMessages.length;
+    const estimatedContextSize = estimateContextSize(messages, summary);
+    logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_TRIGGER", {
+      chatId,
+      messageCount: messages.length,
+      droppedMessageCount: droppedMessages.length,
+      contextSize: estimatedContextSize,
+      pendingCandidateCount: pendingMemoryCandidates.length,
+      messagesSinceLastMemorySave,
+      nextCheckpointCounter: nextCounter,
+    });
+
     const summaryInput = await SUMMARIZE_PROMPT_TEMPLATE.invoke({
       summary: summary || "Belum ada",
-      messages: messages.slice(0, -2),
+      messages: droppedMessages,
     });
     const response = await modelRaw.invoke(summaryInput);
+    const nextSummary = finalizeShortTermSummary(
+      response.content.toString(),
+      summary,
+    );
+    logMemoryEvent("MEMORY_SHORT_TERM_SUMMARY_DONE", {
+      chatId,
+      summaryLength: nextSummary.length,
+      keptRawMessageCount: RECENT_RAW_TAIL_COUNT,
+    });
 
-    const trimmedMessages: ReplaceableMessages = messages.slice(-6);
+    let nextMemorySaveCounter = nextCounter;
+    let nextPendingMemoryCandidates = pendingMemoryCandidates;
+    if (nextCounter >= LONG_TERM_MEMORY_CHECKPOINT_EVERY) {
+      try {
+        logMemoryEvent("MEMORY_LONG_TERM_CHECKPOINT_TRIGGER", {
+          chatId,
+          checkpointCounter: nextCounter,
+          threshold: LONG_TERM_MEMORY_CHECKPOINT_EVERY,
+        });
+
+        const extraction = await extractCheckpointMemories({
+          summary: nextSummary,
+          recentMessages: messages.slice(-RECENT_RAW_TAIL_COUNT),
+          model: modelRaw,
+        });
+        const { pendingCandidates, promotedCandidates } = updatePendingMemoryCandidates(
+          pendingMemoryCandidates,
+          extraction,
+          new Date().toISOString(),
+        );
+
+        logMemoryEvent("MEMORY_LONG_TERM_PENDING_UPDATED", {
+          chatId,
+          factCount: extraction.facts.length,
+          hasEpisodeSummary: Boolean(extraction.episodeSummary),
+          pendingCount: pendingCandidates.length,
+          promotedCount: promotedCandidates.length,
+        });
+
+        await persistPromotedMemories(chatId, promotedCandidates);
+        nextPendingMemoryCandidates = pendingCandidates;
+        nextMemorySaveCounter = 0;
+        logMemoryEvent("MEMORY_LONG_TERM_CHECKPOINT_DONE", {
+          chatId,
+          pendingCount: nextPendingMemoryCandidates.length,
+          promotedCount: promotedCandidates.length,
+        });
+      } catch (error) {
+        console.error("[MEMORY_LONG_TERM_CHECKPOINT_FAILED]", { chatId, error });
+      }
+    }
+
+    const trimmedMessages: ReplaceableMessages = messages.slice(-RECENT_RAW_TAIL_COUNT);
     trimmedMessages._replace = true;
 
     return {
-      summary: cleanAIResponse(response.content.toString()),
+      summary: nextSummary,
       messages: trimmedMessages,
+      messagesSinceLastMemorySave: nextMemorySaveCounter,
+      pendingMemoryCandidates: nextPendingMemoryCandidates,
     };
   }
   return {};
@@ -214,7 +358,6 @@ const workflow = new StateGraph(GraphState)
   .addNode("supervisor", supervisorNode)
   .addNode("recorder", recorderNode)
   .addNode("split_bill", splitBillNode)
-  .addNode("memory", memoryNode)
   .addNode("general_chat", generalChatNode)
   .addNode("tools", new ToolNode(allMcpTools))
 
@@ -224,24 +367,23 @@ const workflow = new StateGraph(GraphState)
   .addConditionalEdges("supervisor", (state) => state.next, {
     recorder: "recorder",
     split_bill: "split_bill",
-    memory: "memory",
     general_chat: "general_chat",
   })
 
   .addConditionalEdges("recorder", (state) => {
+    if (state.forceSupervisorReroute) return "supervisor";
     const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
     return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
   })
   .addConditionalEdges("split_bill", (state) => {
+    if (state.forceSupervisorReroute) return "supervisor";
     const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
     return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
   })
-  .addConditionalEdges("memory", (state) => {
+  .addConditionalEdges("general_chat", (state) => {
+    if (state.forceSupervisorReroute) return "supervisor";
     const lastMsg = state.messages[state.messages.length - 1] as AIMessage;
     return (lastMsg.tool_calls?.length ?? 0) > 0 ? "tools" : END;
-  })
-  .addConditionalEdges("general_chat", () => {
-    return END;
   })
 
   .addConditionalEdges("tools", (state) => {
@@ -252,15 +394,28 @@ const workflow = new StateGraph(GraphState)
       ) as AIMessage;
     if (lastAI) {
       const toolName = lastAI.tool_calls?.[0]?.name;
-        if (
-          ["add_transaction", "get_balance", "list_transactions", "find_transactions", "get_transaction_by_id"].includes(
-            toolName!,
-          )
-        )
+      if (
+        [
+          "add_transaction",
+          "get_balance",
+          "list_transactions",
+          "find_transactions",
+          "get_transaction_by_id",
+        ].includes(toolName!)
+      )
         return "recorder";
-      if (["split_bill", "list_debts", "find_debts", "settle_debt", "get_debts_by_transaction", "get_debt_detail"].includes(toolName!))
+      if (
+        [
+          "split_bill",
+          "list_debts",
+          "find_debts",
+          "settle_debt",
+          "get_debts_by_transaction",
+          "get_debt_detail",
+        ].includes(toolName!)
+      )
         return "split_bill";
-      if (["search_memory", "save_memory"].includes(toolName!)) return "memory";
+      if (["search_memory"].includes(toolName!)) return "general_chat";
     }
     return "supervisor";
   });
@@ -275,11 +430,18 @@ export async function runNaturalChat(chatId: string, userInput: string) {
     config,
   );
   const lastMessage = output.messages[output.messages.length - 1];
-  return lastMessage?.content.toString() || "";
+  return lastMessage?.content.toString().trim() || "Maaf, jawabanku tadi kosong. Coba ulang ya.";
 }
 
 export async function clearChatHistory(chatId: string) {
   const config = { configurable: { thread_id: chatId } };
-  await app.updateState(config, { messages: [], summary: "" });
+  await app.updateState(config, {
+    messages: [],
+    summary: "",
+    messagesSinceLastMemorySave: 0,
+    pendingMemoryCandidates: [],
+    forceSupervisorReroute: false,
+    rerouteReason: "",
+  });
   return "Sesi berhasil direset!";
 }

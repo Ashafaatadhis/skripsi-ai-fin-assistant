@@ -19,7 +19,11 @@ export async function runVisionAnalysis(
     new SystemMessage(GENERAL_VISION_SYSTEM_PROMPT),
     new HumanMessage({
       content: [
-        { type: "text", text: "Mohon analisa foto ini." },
+        {
+          type: "text",
+          text:
+            "Mohon analisa foto ini. Jika ini struk, keluarkan JSON valid saja dan pastikan setiap item memakai qty, unitPrice, dan lineTotal yang benar. Contoh: `2 x 9000 = 18000` harus menjadi qty=2, unitPrice=9000, lineTotal=18000.",
+        },
         { type: "image_url", image_url: { url: imageUrl } },
       ],
     }),

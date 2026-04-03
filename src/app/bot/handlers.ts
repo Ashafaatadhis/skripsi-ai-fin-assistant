@@ -3,6 +3,26 @@ import { Context } from "telegraf";
 import { message } from "telegraf/filters";
 import { clearChatHistory, runNaturalChat } from "@/app/chains/groq_chain.js";
 import { runVisionAnalysis } from "@/app/chains/vision_chain.js";
+import { sanitizeTelegramHtml, stripTelegramHtml } from "@/app/bot/telegram-format.js";
+
+async function replyWithSafeTelegramHtml(ctx: Context, text: string) {
+  const fallbackText = stripTelegramHtml(text).trim() || "Maaf, jawabanku tadi kosong. Coba ulang ya.";
+  const sanitized = sanitizeTelegramHtml(text).trim();
+
+  if (!sanitized) {
+    await ctx.reply(fallbackText);
+    return;
+  }
+
+  try {
+    await ctx.reply(sanitized, {
+      parse_mode: "HTML",
+    });
+  } catch (error) {
+    console.error("Telegram HTML parse failed, retrying plain text:", error);
+    await ctx.reply(stripTelegramHtml(sanitized).trim() || fallbackText);
+  }
+}
 
 export const handleTextMessage = async (ctx: Context) => {
   // Pastikan hanya memproses pesan teks
@@ -19,9 +39,7 @@ export const handleTextMessage = async (ctx: Context) => {
     const aiResponse = await runNaturalChat(chatId, userText);
 
     // Kirim jawaban ke user
-    await ctx.reply(aiResponse, {
-      parse_mode: "HTML",
-    });
+    await replyWithSafeTelegramHtml(ctx, aiResponse);
   } catch (error) {
     console.error("Groq Error:", error);
     await ctx.reply("Duh, koneksi ke otak saya lagi putus. Coba lagi ya!");
@@ -51,7 +69,7 @@ export const handlePhotoMessage = async (ctx: Context) => {
     );
 
     // Kirim hasil akhir
-    await ctx.reply(analysis, { parse_mode: "HTML" });
+    await replyWithSafeTelegramHtml(ctx, analysis);
   } catch (error) {
     console.error("Vision Error:", error);
     await ctx.reply("Duh, kamera gue burem. Coba kirim ulang struknya!");
