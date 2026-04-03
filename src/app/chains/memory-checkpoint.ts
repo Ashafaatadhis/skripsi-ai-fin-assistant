@@ -20,6 +20,7 @@ export type MemoryFactCandidate = {
 };
 
 export type EpisodeSummaryCandidate = {
+  topicKey: string;
   content: string;
   importanceScore?: number;
 } | null;
@@ -52,7 +53,6 @@ const FACT_CATEGORIES = new Set<FactCategory>([
 ]);
 
 const FACT_PROMOTION_MIN_SEEN = 2;
-const FACT_PROMOTION_MAX_CHECKPOINTS = 2;
 const EPISODE_PROMOTION_MIN_SEEN = 2;
 const EPISODE_PROMOTION_MAX_CHECKPOINTS = 3;
 const EPISODE_PROMOTION_MIN_IMPORTANCE = 0.6;
@@ -130,8 +130,11 @@ export function parseMemoryCheckpointResponse(rawText: string): MemoryCheckpoint
     .slice(0, 3);
 
   const episodeSummary =
-    parsed.episodeSummary && typeof parsed.episodeSummary.content === "string"
+    parsed.episodeSummary &&
+    typeof parsed.episodeSummary.content === "string" &&
+    typeof parsed.episodeSummary.topicKey === "string"
       ? {
+          topicKey: normalizeCanonicalKey(parsed.episodeSummary.topicKey),
           content: normalizeContent(parsed.episodeSummary.content),
           importanceScore: clampScore(parsed.episodeSummary.importanceScore, 0.55),
         }
@@ -146,10 +149,15 @@ export function parseMemoryCheckpointResponse(rawText: string): MemoryCheckpoint
 function getCandidateKey(candidate: {
   memoryType: "fact" | "episode_summary";
   canonicalKey?: string;
+  topicKey?: string;
   content: string;
 }) {
   if (candidate.memoryType === "fact" && candidate.canonicalKey) {
     return `fact:${candidate.canonicalKey}`;
+  }
+
+  if (candidate.memoryType === "episode_summary" && candidate.topicKey) {
+    return `episode:${candidate.topicKey}`;
   }
 
   return `episode:${normalizeContent(candidate.content).toLowerCase()}`;
@@ -187,10 +195,12 @@ export function buildPendingMemoryCandidates(
     candidates.push({
       candidateKey: getCandidateKey({
         memoryType: "episode_summary",
+        topicKey: extraction.episodeSummary.topicKey,
         content: extraction.episodeSummary.content,
       }),
       memoryType: "episode_summary",
       category: "episode",
+      canonicalKey: extraction.episodeSummary.topicKey,
       content: extraction.episodeSummary.content,
       confidence: 0.7,
       firstSeenAt: nowIso,

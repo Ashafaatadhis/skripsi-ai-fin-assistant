@@ -60,13 +60,14 @@ Variabel aktif sekarang:
 
 ```ts
 export const RECENT_RAW_TAIL_COUNT = 6;
-export const SOFT_CONTEXT_LIMIT = 14000;
+export const SOFT_CONTEXT_LIMIT = 3500;
 ```
 
 Artinya:
 - `RECENT_RAW_TAIL_COUNT = 6`
   - sistem selalu berusaha menyisakan 6 raw message terakhir
-- `SOFT_CONTEXT_LIMIT = 14000`
+- `SOFT_CONTEXT_LIMIT = 3500`
+  - estimasi token (1 token ≈ 4 karakter)
   - jika ukuran gabungan `summary + messages` melewati angka ini, short-term akan diringkas
 
 Function penting:
@@ -195,6 +196,7 @@ Contoh output:
     }
   ],
   "episodeSummary": {
+    "topicKey": "budgeting_focus",
     "content": "User sedang fokus merapikan pengeluaran bulan ini.",
     "importanceScore": 0.7
   }
@@ -244,6 +246,7 @@ Contoh output extractor yang masuk akal:
     }
   ],
   "episodeSummary": {
+    "topicKey": "budgeting_focus",
     "content": "User sedang fokus merapikan pengeluaran dan budgeting bulan ini.",
     "importanceScore": 0.7
   }
@@ -277,8 +280,10 @@ Contoh:
 ### Episode Summary
 Dipakai untuk konteks rangkuman episode percakapan.
 
+Episode summary punya `topicKey` (stable identifier, snake_case) yang dipakai sebagai `candidateKey`. Ini memastikan episode yang sama, meski kalimatnya sedikit berbeda di checkpoint berikutnya, tetap dikenali sebagai kandidat yang sama dan `seenCount`-nya bisa naik.
+
 Contoh:
-- `User sedang fokus mengatur pengeluaran selama bulan ini.`
+- `topicKey: "budgeting_focus"`, content: `User sedang fokus mengatur pengeluaran selama bulan ini.`
 
 ## 7. Pending Memory Candidates
 
@@ -345,9 +350,10 @@ Contoh candidate episode summary:
 
 ```ts
 {
-  candidateKey: "episode:user_sedang_fokus_merapikan_pengeluaran_bulan_ini",
+  candidateKey: "episode:budgeting_focus",
   memoryType: "episode_summary",
   category: "episode",
+  canonicalKey: "budgeting_focus",
   content: "User sedang fokus merapikan pengeluaran bulan ini.",
   confidence: 0.7,
   importanceScore: 0.7,
@@ -385,7 +391,6 @@ Variabel aktif sekarang:
 
 ```ts
 const FACT_PROMOTION_MIN_SEEN = 2;
-const FACT_PROMOTION_MAX_CHECKPOINTS = 2;
 const EPISODE_PROMOTION_MIN_SEEN = 2;
 const EPISODE_PROMOTION_MAX_CHECKPOINTS = 3;
 const EPISODE_PROMOTION_MIN_IMPORTANCE = 0.6;
@@ -406,17 +411,15 @@ Fact dipromote kalau:
 - `seenCount >= 2`
 
 Artinya fact tidak boleh auto-promote hanya karena bertahan hidup di pending.
-Fact harus benar-benar muncul lagi atau terkonfirmasi lagi.
+Fact harus benar-benar muncul lagi dari hasil ekstraksi LLM.
 
-Contoh:
-- checkpoint 1: `Nama user adalah Adhis.` muncul -> pending
-- checkpoint 2: kandidat yang sama muncul lagi -> `seenCount = 2`
-- hasil: promote
+Contoh fact yang promote:
+- checkpoint 1: `Nama user adalah Adhis.` muncul -> pending, `seenCount=1`
+- checkpoint 2: kandidat yang sama muncul lagi -> `seenCount=2` -> promote
 
-Kalau fact hanya bertahan hidup tanpa muncul lagi:
-- checkpoint 1: muncul sekali
-- checkpoint 2: tidak muncul lagi -> `checkpointCount = 2`
-- hasil: tetap pending, belum promote
+Contoh fact yang tetap pending:
+- checkpoint 1: muncul sekali -> pending, `seenCount=1`
+- checkpoint 2: tidak muncul lagi -> `checkpointCount=2`, `seenCount=1` -> tetap pending
 
 Contoh bentuk candidate yang sudah promote:
 
@@ -715,11 +718,11 @@ Kondisi awal:
 Belum dipromote.
 
 ### Tahap E: Checkpoint Berikutnya
-Jika fact yang sama muncul lagi, atau tetap hidup sampai checkpoint berikutnya:
-- `seenCount` bisa naik menjadi `2`
-- atau `checkpointCount` menjadi `2`
+Jika fact yang sama muncul lagi di ekstraksi LLM:
+- `seenCount` naik menjadi `2` -> promote
 
-Untuk fact, salah satu kondisi itu sudah cukup untuk promote.
+Jika fact tidak muncul lagi:
+- `checkpointCount` naik tapi `seenCount` tetap 1 -> tetap pending sampai `checkpointCount > 4` lalu di-drop
 
 ### Tahap F: Save ke Long-Term
 Setelah dipromote:

@@ -32,30 +32,6 @@ Ringkasan sebelumnya:
   ["user", "Perbarui ringkasan kerja berdasarkan percakapan di atas."],
 ]);
 
-export const MEMORY_EXTRACTOR_PROMPT_TEMPLATE = ChatPromptTemplate.fromMessages(
-  [
-    [
-      "system",
-      `Tugas kamu adalah mengekstrak FAKTA UNIK atau PREFERENSI user dari percakapan.
-
-ATURAN KETAT:
-1. JANGAN simpan data transaksi finansial (Jumlah uang, Nama Toko, Item Belanja). Data ini sudah ada di Database Keuangan.
-   - Contoh JANGAN disimpan: "User belanja di Lab Kopi 20rb".
-2. JANGAN simpan status internal AI atau kekurangan konteks.
-   - Contoh JANGAN disimpan: "AI butuh klarifikasi tentang ID hutang", "User belum kasih nama teman".
-3. SIMPAN hanya hal-hal non-transaksional yang membantu kamu mengenal user, seperti:
-   - Hubungan/Profil: "Nopal itu teman dekat", "Gue mahasiswa semester 5".
-   - Kebiasaan/Preferensi: "Gue suka ngopi tiap pagi", "Gue lebih suka belanja di pasar daripada mall".
-   - Tujuan/Rencana: "Mau beli motor tahun depan", "Niatnya mau mulai investasi saham".
-   - Keluhan/Sentimen: "Ngerasa bulan ini boros banget", "Lagi pusing cicilan".
-
-Format Output: [Kategori] Fakta singkat yang padat (Bahasa Indonesia).
-Jika tidak ada informasi yang layak diingat sesuai kriteria di atas, balas HANYA dengan kata "NIHIL".`,
-    ],
-    ["user", "{userInput}"],
-  ],
-);
-
 export const MEMORY_CHECKPOINT_PROMPT_TEMPLATE =
   ChatPromptTemplate.fromMessages([
     [
@@ -82,6 +58,7 @@ KELUARKAN JSON VALID SAJA dengan bentuk:
     }}
   ],
   "episodeSummary": {{
+    "topicKey": "string (snake_case, stabil dan deskriptif, contoh: budgeting_focus, debt_settlement, income_tracking)",
     "content": "string",
     "importanceScore": 0.0
   }} | null

@@ -2,10 +2,10 @@ import { BaseMessage } from "@langchain/core/messages";
 import { getMessageText } from "@/app/chains/clarification.js";
 
 export const RECENT_RAW_TAIL_COUNT = 6;
-export const SOFT_CONTEXT_LIMIT = 14000;
+export const SOFT_CONTEXT_LIMIT = 3500;
 
 function estimateTextSize(text: string) {
-  return text.trim().length;
+  return Math.ceil(text.trim().length / 4);
 }
 
 export function estimateMessageSize(message: BaseMessage) {
