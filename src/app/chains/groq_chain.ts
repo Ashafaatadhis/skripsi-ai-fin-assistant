@@ -9,7 +9,6 @@ import {
 import {
   Annotation,
   StateGraph,
-  MemorySaver,
   START,
   END,
   type LangGraphRunnableConfig,
@@ -22,6 +21,7 @@ import {
   SUMMARIZE_PROMPT_TEMPLATE,
 } from "@/app/chains/prompt.js";
 import { cleanAIResponse } from "@/app/chains/clarification.js";
+import { createInitializedCheckpointer } from "@/app/chains/checkpointer.js";
 import {
   type PendingMemoryCandidate,
   extractCheckpointMemories,
@@ -420,7 +420,7 @@ const workflow = new StateGraph(GraphState)
     return "supervisor";
   });
 
-const checkpointer = new MemorySaver();
+const checkpointer = await createInitializedCheckpointer();
 export const app = workflow.compile({ checkpointer });
 
 export async function runNaturalChat(chatId: string, userInput: string) {
