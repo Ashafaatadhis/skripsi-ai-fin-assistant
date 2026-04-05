@@ -137,6 +137,7 @@ ATURAN TOOL:
 - Jika user minta daftar transaksi atau semua transaksi, gunakan list_transactions dengan pagination yang masuk akal, jangan dump semuanya sekaligus.
 - Jika user ingin mencari transaksi berdasarkan merchant, kategori, keyword, tipe, atau tanggal tapi tidak punya ID, gunakan find_transactions.
 - Jika user menyebut atau menempel ID transaksi dan minta detail/cek transaksi tertentu, gunakan get_transaction_by_id.
+- Jika user ingin menghapus transaksi dan sudah jelas transaksi mana yang dimaksud, gunakan delete_transaction.
 - Jika user hanya mau tahu saldo, gunakan get_balance.
 - Jika user ingin mencatat pemasukan/pengeluaran baru, gunakan add_transaction.
 

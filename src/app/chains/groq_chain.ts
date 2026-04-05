@@ -177,11 +177,12 @@ function formatCurrency(value: unknown) {
 }
 
 function getLastToolCallingAIMessage(messages: BaseMessage[]) {
-  return [...messages]
-    .reverse()
-    .find(
-      (message) => message instanceof AIMessage && (message as AIMessage).tool_calls?.length,
-    ) as AIMessage | undefined;
+  const lastMessage = messages[messages.length - 1];
+  if (!(lastMessage instanceof AIMessage)) {
+    return undefined;
+  }
+
+  return (lastMessage.tool_calls?.length ?? 0) > 0 ? lastMessage : undefined;
 }
 
 function getPrimaryToolCall(messages: BaseMessage[]) {
@@ -189,7 +190,7 @@ function getPrimaryToolCall(messages: BaseMessage[]) {
 }
 
 function needsConfirmation(toolName?: string | null) {
-  return ["add_transaction", "split_bill", "settle_debt"].includes(toolName ?? "");
+  return ["add_transaction", "delete_transaction", "split_bill", "settle_debt"].includes(toolName ?? "");
 }
 
 function formatAddTransactionConfirmation(args: Record<string, unknown>) {
@@ -217,6 +218,14 @@ function formatSplitBillConfirmation(args: Record<string, unknown>) {
   ].join("\n");
 }
 
+function formatDeleteTransactionConfirmation(args: Record<string, unknown>) {
+  return [
+    "Konfirmasi hapus transaksi:",
+    `- Transaction ID: ${String(args.transactionId ?? "-")}`,
+    'Balas "ya" untuk lanjut atau "batal" untuk membatalkan.',
+  ].join("\n");
+}
+
 function formatSettleDebtConfirmation(args: Record<string, unknown>) {
   return [
     "Konfirmasi pelunasan hutang:",
@@ -233,6 +242,8 @@ function formatConfirmation(toolCall: { name: string; args?: Record<string, unkn
       return formatAddTransactionConfirmation(args);
     case "split_bill":
       return formatSplitBillConfirmation(args);
+    case "delete_transaction":
+      return formatDeleteTransactionConfirmation(args);
     case "settle_debt":
       return formatSettleDebtConfirmation(args);
     default:
@@ -267,6 +278,7 @@ function buildCancelledConfirmationResult(
       new ToolMessage({
         content: "[TOOL_CANCELLED] User rejected confirmation.",
         tool_call_id: toolCall.id,
+        name: toolCall.name,
       }),
     );
   }
@@ -289,6 +301,7 @@ const allMcpTools = await getMcpTools();
 const recorderTools = allMcpTools.filter((t) =>
   [
     "add_transaction",
+    "delete_transaction",
     "get_balance",
     "list_transactions",
     "find_transactions",
@@ -727,16 +740,13 @@ const workflow = new StateGraph(GraphState)
   })
 
   .addConditionalEdges("tools", (state) => {
-    const lastAI = [...state.messages]
-      .reverse()
-      .find(
-        (m) => m instanceof AIMessage && (m as AIMessage).tool_calls?.length,
-      ) as AIMessage;
-    if (lastAI) {
+    const lastAI = state.messages[state.messages.length - 1];
+    if (lastAI instanceof AIMessage) {
       const toolName = lastAI.tool_calls?.[0]?.name;
       if (
         [
           "add_transaction",
+          "delete_transaction",
           "get_balance",
           "list_transactions",
           "find_transactions",

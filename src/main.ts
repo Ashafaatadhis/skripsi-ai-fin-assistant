@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { Telegraf } from "telegraf";
 import { message } from "telegraf/filters";
-import { handlePhotoMessage, handleTextMessage } from "@/app/bot/handlers.js";
+import { handleClearCommand, handlePhotoMessage, handleTextMessage } from "@/app/bot/handlers.js";
 import { getLogger } from "@/lib/logger.js";
 
 const logger = getLogger("main");
@@ -26,6 +26,8 @@ bot.start((ctx) => {
       "atau chat biasa untuk konsultasi keuangan.",
   );
 });
+
+bot.command("clear", handleClearCommand);
 
 // 3. Test Handler (Hapus ini jika sudah pakai file handlers)
 bot.on(message("text"), handleTextMessage);
